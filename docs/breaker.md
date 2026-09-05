@@ -1,7 +1,6 @@
 # breaker
 
-The circuit breaker package: `github.com/mgiaccone/keel/breaker`. See
-[development](development.md) for how it is tested.
+The circuit breaker package: `github.com/mgiaccone/keel/breaker`.
 
 ```go
 b, err := breaker.New("db-fallback",
@@ -255,7 +254,6 @@ label, so Alertmanager can route each dependency to the team that owns it.
 The rules live in `contrib/prometheus/alerts.yaml`, ready for
 `promtool check rules` and for dropping into your rule files. In outline:
 
-
 | Rule | Severity | Fires when |
 |---|---|---|
 | `breaker:open_fraction` (recording) | | share of instances whose circuit is open, per dependency |
@@ -265,18 +263,6 @@ The rules live in `contrib/prometheus/alerts.yaml`, ready for
 | `BreakerBulkheadSaturated` | ticket | bulkhead at its cap for 5m outside a recovery ramp: the backend is slow, not down |
 | `BreakerMetricsAbsent` | ticket | no series for an expected dependency: a forgotten `Register` or a breaker never created |
 
-  # Bulkhead saturation without an open circuit: the backend is slow, not
-  # down. Usually a ticket; the timeout and the cap bound the damage. A
-  # saturated cap during a recovery ramp is the ramp doing its job, so those
-  # are excluded.
-  - alert: BreakerBulkheadSaturated
-    expr: |
-      max by (dependency) (
-        (go_breaker_in_flight / go_breaker_in_flight_limit >= 1)
-          unless on (dependency, instance) go_breaker_ramping == 1
-      )
-    for: 5m
-    labels: { severity: ticket }
 
 What not to alert on:
 
@@ -334,6 +320,25 @@ is only useful as the derived countdown `… - time()`.
 
 The same dashboard carries a collapsed row for rate limiters; see the
 `ratelimit` document.
+
+## Testing
+
+The suite has three layers beyond the per-property tests. Every blocking wait
+in it carries a deadline, so a deadlock fails at a named line rather than
+hanging until the `go test` timeout; `-short` trims the model and chaos
+iterations.
+
+- **A reference model.** `TestModel` drives the breaker and an independent
+  single-threaded model of the documented rules through the same random
+  sequences of admissions, out-of-order settles and clock advances, and
+  compares `Stats` after every step. A divergence prints the seed.
+- **Chaos with invariants.** `TestChaosInvariants` hammers one breaker from
+  many goroutines with random outcomes, cancellations, clock advances and
+  inspections, checks the accounting invariants at every observation, and
+  verifies afterwards that every transition the hook saw was a legal edge.
+- **Regression pins.** The settle-before-apply clock race, zero allocations
+  per call, probe-slot release on panic, goroutine release on `Stop`, and
+  free-list overflow each have a dedicated test.
 
 ## Benchmarks
 

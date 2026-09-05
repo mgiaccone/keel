@@ -1,8 +1,7 @@
 # ratelimit
 
 The rate limiter package: `github.com/mgiaccone/keel/ratelimit`, with the Redis
-store in `github.com/mgiaccone/keel/ratelimit/goredis`. See
-[development](development.md) for how it is tested.
+store in `github.com/mgiaccone/keel/ratelimit/goredis`.
 
 A rate limiter bounds how many calls *start* per unit of time, however fast
 they complete; the bulkhead bounds how many are *outstanding*. It stands on
