@@ -82,14 +82,12 @@ func MustRegister(reg prometheus.Registerer, opts ...RegisterOption) {
 
 // metrics is one limiter's resolved series.
 type metrics struct {
-	name                                string
 	allowed, limited, errors, conflicts prometheus.Counter
 	keys                                prometheus.Gauge
 }
 
 func newMetrics(name, algorithm string) *metrics {
 	return &metrics{
-		name:      name,
 		allowed:   _decisionsCounter.WithLabelValues(name, algorithm, "allowed"),
 		limited:   _decisionsCounter.WithLabelValues(name, algorithm, "limited"),
 		errors:    _decisionsCounter.WithLabelValues(name, algorithm, "error"),
@@ -104,11 +102,4 @@ func (m *metrics) started() {
 	m.errors.Add(0)
 	m.conflicts.Add(0)
 	m.keys.Set(0)
-}
-
-func (m *metrics) stopped() {
-	labels := prometheus.Labels{"limiter": m.name}
-	for _, c := range _collectors {
-		c.(interface{ DeletePartialMatch(prometheus.Labels) int }).DeletePartialMatch(labels)
-	}
 }

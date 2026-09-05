@@ -1,8 +1,10 @@
 package breaker
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,11 +12,11 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 )
 
-// registry returns a fresh registry with the package metrics registered. The
-// vectors themselves are package-level, so each test uses its own dependency
-// name and relies on Stop (via the harness cleanup) to delete its series.
+// registry returns a fresh registry with the package metrics registered.
 func registry(t *testing.T) *prometheus.Registry {
 	t.Helper()
 	reg := prometheus.NewPedanticRegistry()
@@ -22,6 +24,69 @@ func registry(t *testing.T) *prometheus.Registry {
 		t.Fatal(err)
 	}
 	return reg
+}
+
+// compareSeries checks the exposition of one dependency's series against want.
+// The vectors are package-level and other tests' breakers, and breakers not
+// yet collected, live alongside, so the gathered families are filtered to the
+// dependency before comparing.
+func compareSeries(t *testing.T, reg prometheus.Gatherer, dependency, want string, names ...string) {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kept []*dto.MetricFamily
+	for _, f := range families {
+		if len(names) > 0 && !slices.Contains(names, f.GetName()) {
+			continue
+		}
+		var metrics []*dto.Metric
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "dependency" && l.GetValue() == dependency {
+					metrics = append(metrics, m)
+				}
+			}
+		}
+		if len(metrics) > 0 {
+			f.Metric = metrics
+			kept = append(kept, f)
+		}
+	}
+	var got bytes.Buffer
+	enc := expfmt.NewEncoder(&got, expfmt.NewFormat(expfmt.TypeTextPlain))
+	for _, f := range kept {
+		if err := enc.Encode(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if strings.TrimSpace(got.String()) != strings.TrimSpace(want) {
+		t.Fatalf("series for %q differ:\n got:\n%s\nwant:\n%s", dependency, got.String(), want)
+	}
+}
+
+// countSeries counts one dependency's series of a metric.
+func countSeries(t *testing.T, reg prometheus.Gatherer, name, dependency string) int {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, f := range families {
+		if f.GetName() != name {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "dependency" && l.GetValue() == dependency {
+					n++
+				}
+			}
+		}
+	}
+	return n
 }
 
 func TestRegisterTwiceFails(t *testing.T) {
@@ -45,17 +110,16 @@ func TestRegisterWithNamespace(t *testing.T) {
 	if err := Register(reg, WithNamespace("inventory")); err != nil {
 		t.Fatal(err)
 	}
-	newNamedHarness(t, "ns")
+	const dep = "ns"
+	newNamedHarness(t, dep)
 	want := `
 # HELP inventory_breaker_trips_total Total closed/half-open to open transitions.
 # TYPE inventory_breaker_trips_total counter
 inventory_breaker_trips_total{dependency="ns"} 0
 `
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "inventory_breaker_trips_total"); err != nil {
-		t.Fatal(err)
-	}
-	if n, _ := testutil.GatherAndCount(reg, "go_breaker_trips_total"); n != 0 {
-		t.Fatalf("default-namespace series present under a custom namespace: %d", n)
+	compareSeries(t, reg, dep, want, "inventory_breaker_trips_total")
+	if n, err := testutil.GatherAndCount(reg, "go_breaker_trips_total"); err != nil || n != 0 {
+		t.Fatalf("default-namespace series present under a custom namespace: %d (err %v)", n, err)
 	}
 }
 
@@ -85,7 +149,8 @@ func TestMetricsLint(t *testing.T) {
 
 func TestMetricsSeriesExistAtZeroFromStart(t *testing.T) {
 	reg := registry(t)
-	newNamedHarness(t, "zero")
+	const dep = "zero"
+	newNamedHarness(t, dep)
 	want := `
 # HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.
 # TYPE go_breaker_calls_total counter
@@ -104,14 +169,13 @@ go_breaker_state{dependency="zero",state="open"} 0
 # TYPE go_breaker_trips_total counter
 go_breaker_trips_total{dependency="zero"} 0
 `
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "go_breaker_calls_total", "go_breaker_state", "go_breaker_trips_total"); err != nil {
-		t.Fatal(err)
-	}
+	compareSeries(t, reg, dep, want, "go_breaker_calls_total", "go_breaker_state", "go_breaker_trips_total")
 }
 
 func TestMetricsFollowEvents(t *testing.T) {
 	reg := registry(t)
-	h := newNamedHarness(t, "events", WithFailureThreshold(2), WithOpenInterval(10*time.Second, time.Minute))
+	const dep = "events"
+	h := newNamedHarness(t, dep, WithFailureThreshold(2), WithOpenInterval(10*time.Second, time.Minute))
 	h.ok(t)
 	h.Do(t.Context(), func(context.Context) (int, error) { return 0, context.Canceled })
 	h.fail(t)
@@ -152,9 +216,7 @@ go_breaker_state{dependency="events",state="open"} 1
 # TYPE go_breaker_trips_total counter
 go_breaker_trips_total{dependency="events"} 1
 `
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want)); err != nil {
-		t.Fatal(err)
-	}
+	compareSeries(t, reg, dep, want)
 
 	// Recovery: half-open on the next call, closed after two probe successes.
 	h.clock.Add(10 * time.Second)
@@ -173,14 +235,13 @@ go_breaker_state{dependency="events",state="closed"} 1
 go_breaker_state{dependency="events",state="half-open"} 0
 go_breaker_state{dependency="events",state="open"} 0
 `
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "go_breaker_state", "go_breaker_open_until_timestamp_seconds", "go_breaker_consecutive_trips"); err != nil {
-		t.Fatal(err)
-	}
+	compareSeries(t, reg, dep, want, "go_breaker_state", "go_breaker_open_until_timestamp_seconds", "go_breaker_consecutive_trips")
 }
 
 func TestMetricsInFlightAndLimit(t *testing.T) {
 	reg := registry(t)
-	h := newNamedHarness(t, "load", WithMaxInFlight(2))
+	const dep = "load"
+	h := newNamedHarness(t, dep, WithMaxInFlight(2))
 	entered, finish := make(chan struct{}, 2), make(chan struct{})
 	for range 2 {
 		go h.Do(context.Background(), func(context.Context) (int, error) {
@@ -200,9 +261,7 @@ go_breaker_in_flight{dependency="load"} 2
 # TYPE go_breaker_in_flight_limit gauge
 go_breaker_in_flight_limit{dependency="load"} 2
 `
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "go_breaker_in_flight", "go_breaker_in_flight_limit"); err != nil {
-		t.Fatal(err)
-	}
+	compareSeries(t, reg, dep, want, "go_breaker_in_flight", "go_breaker_in_flight_limit")
 	if v := testutil.ToFloat64(_callsCounter.WithLabelValues("load", "shed")); v != 1 {
 		t.Fatalf("shed = %v, want 1", v)
 	}
@@ -211,7 +270,8 @@ go_breaker_in_flight_limit{dependency="load"} 2
 
 func TestMetricsRamping(t *testing.T) {
 	reg := registry(t)
-	h := newNamedHarness(t, "ramp", WithFailureThreshold(1), WithSuccessThreshold(1), WithMaxInFlight(4), WithRecoveryRamp(1, 2))
+	const dep = "ramp"
+	h := newNamedHarness(t, dep, WithFailureThreshold(1), WithSuccessThreshold(1), WithMaxInFlight(4), WithRecoveryRamp(1, 2))
 	h.trip(t)
 	h.clock.Add(time.Second)
 	h.ok(t) // close: ramping at 1
@@ -223,9 +283,7 @@ go_breaker_in_flight_limit{dependency="ramp"} 1
 # TYPE go_breaker_ramping gauge
 go_breaker_ramping{dependency="ramp"} 1
 `
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "go_breaker_in_flight_limit", "go_breaker_ramping"); err != nil {
-		t.Fatal(err)
-	}
+	compareSeries(t, reg, dep, want, "go_breaker_in_flight_limit", "go_breaker_ramping")
 	h.ok(t) // 1 -> 2 == end
 	if v := testutil.ToFloat64(_rampingGauge.WithLabelValues("ramp")); v != 0 {
 		t.Fatalf("ramping after end = %v", v)
@@ -242,8 +300,10 @@ func TestManyBreakersOneRegistration(t *testing.T) {
 	a.trip(t)
 	b.ok(t)
 
-	if n, _ := testutil.GatherAndCount(reg, "go_breaker_state"); n != 6 {
-		t.Fatalf("go_breaker_state series = %d, want 6 (two breakers × three states)", n)
+	for _, dep := range []string{"many-a", "many-b"} {
+		if n := countSeries(t, reg, "go_breaker_state", dep); n != 3 {
+			t.Fatalf("%s: go_breaker_state series = %d, want 3", dep, n)
+		}
 	}
 	if v := testutil.ToFloat64(_stateGauge.WithLabelValues("many-a", "open")); v != 1 {
 		t.Errorf("many-a open = %v, want 1", v)
@@ -252,12 +312,12 @@ func TestManyBreakersOneRegistration(t *testing.T) {
 		t.Errorf("many-b closed = %v, want 1", v)
 	}
 
-	// Stopping one breaker removes only its series.
+	// Stopping one breaker removes only its series, immediately.
 	a.Stop()
-	if n, _ := testutil.GatherAndCount(reg, "go_breaker_state"); n != 3 {
-		t.Fatalf("go_breaker_state series after Stop = %d, want 3", n)
+	if n := countSeries(t, reg, "go_breaker_state", "many-a"); n != 0 {
+		t.Fatalf("many-a series after Stop = %d, want 0", n)
 	}
-	if n, _ := testutil.GatherAndCount(reg, "go_breaker_calls_total"); n != 6 {
-		t.Fatalf("go_breaker_calls_total series after Stop = %d, want 6", n)
+	if n := countSeries(t, reg, "go_breaker_calls_total", "many-b"); n != 6 {
+		t.Fatalf("many-b go_breaker_calls_total series = %d, want 6", n)
 	}
 }

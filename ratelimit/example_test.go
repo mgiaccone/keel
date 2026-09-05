@@ -26,7 +26,6 @@ func Example_httpMiddleware() {
 	if err != nil {
 		panic(err) // example only
 	}
-	defer limiter.Stop()
 
 	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
 	srv := httptest.NewServer(ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
@@ -69,7 +68,6 @@ func Example_breaker() {
 	if err != nil {
 		panic(err) // example only
 	}
-	defer limiter.Stop()
 
 	// The breaker vetoes calls the limiter refuses. Such a call never runs,
 	// costs no quota if the circuit is open, and shows up in the breaker's
@@ -81,7 +79,6 @@ func Example_breaker() {
 	if err != nil {
 		panic(err) // example only
 	}
-	defer b.Stop()
 
 	ctx := context.Background()
 	denied := 0

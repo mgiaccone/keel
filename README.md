@@ -31,7 +31,6 @@ b, err := breaker.New("db-fallback",
 if err != nil {
     return err // wraps breaker.ErrInvalidOption; lists every bad option
 }
-defer b.Stop()
 
 row, err := b.Do(ctx, func(ctx context.Context) (Row, error) {
     return db.Get(ctx, key)
@@ -212,8 +211,10 @@ that open period; `Stats.NextProbeIn` counts down to it.
   from before a trip cannot close a circuit that has since opened.
 - Open → half-open is evaluated lazily when a call or `Stats` arrives. With no
   traffic there is nothing to recover for, and no goroutine is woken.
-- `Stop` is idempotent and concurrency-safe. In-flight calls finish; their
-  outcomes are discarded. `Do` afterwards returns `ErrStopped`.
+- Nothing to stop or close. The state goroutine lives while the breaker is
+  reachable and stops itself once it is not, like a `time.Timer`; a breaker
+  created at bootstrap simply lives for the process. `Stop` exists for
+  deterministic teardown and is optional.
 
 ## Prometheus
 
@@ -266,7 +267,7 @@ against a third party, or compose it with the breaker on an outbound path.
 // A limiter is an algorithm applied to records in a store.
 store, err := ratelimit.NewMemoryStore()                    // per instance
 store    := goredis.NewStore(client)                        // or one quota across the fleet
-limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   // 100/s per key, bursts of 20
+limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   // 100/s per key, bursts of 20; nothing to close
 
 // Inbound, as a plain net/http middleware: allowed requests carry
 // X-RateLimit-Remaining; refused ones get Retry-After and 429.

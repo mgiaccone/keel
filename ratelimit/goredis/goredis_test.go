@@ -98,7 +98,6 @@ func TestGCRAThroughRedis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Stop()
 	ctx := context.Background()
 	for i := range 3 {
 		d, err := l.Allow(ctx, "k")
@@ -129,7 +128,6 @@ func TestLimitIsSharedAcrossClients(t *testing.T) {
 	p := prefix()
 	a, _ := ratelimit.New("shared", ratelimit.GCRA(1, 2), goredis.NewStore(client, goredis.WithKeyPrefix(p)))
 	b, _ := ratelimit.New("shared", ratelimit.GCRA(1, 2), goredis.NewStore(other, goredis.WithKeyPrefix(p)))
-	defer a.Stop()
 	ctx := context.Background()
 	a.Allow(ctx, "k")
 	b.Allow(ctx, "k")
@@ -150,7 +148,6 @@ func TestEveryAlgorithmWorksOnRedis(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer l.Stop()
 			ctx := context.Background()
 			for i := range 2 {
 				if d, err := l.Allow(ctx, "k"); err != nil || !d.Allowed {
@@ -171,7 +168,6 @@ func TestUnreachableServerIsAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Stop()
 	if _, err := l.Allow(context.Background(), "k"); err == nil {
 		t.Fatal("expected an error from an unreachable server")
 	}

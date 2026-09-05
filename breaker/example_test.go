@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/expfmt"
 
 	"github.com/mgiaccone/keel/breaker"
 )
@@ -139,9 +138,6 @@ func (r *Repository) Get(ctx context.Context, key string) (Record, error) {
 // Health exposes the breaker snapshot for a health endpoint.
 func (r *Repository) Health() breaker.Stats { return r.fallback.Stats() }
 
-// Close releases the breaker's goroutine.
-func (r *Repository) Close() { r.fallback.Stop() }
-
 type fakeCache map[string]Record
 
 func (c fakeCache) Get(_ context.Context, key string) (Record, bool, error) {
@@ -195,7 +191,6 @@ func Example() {
 	if err != nil {
 		panic(err) // example only; a service would return this from its constructor
 	}
-	defer repo.Close()
 	ctx := context.Background()
 
 	show := func(key string) {
@@ -261,15 +256,15 @@ func ExampleRegister() {
 		panic(err) // example only
 	}
 
-	// Every breaker reports under its name as the dependency label.
-	b, err := breaker.New("db-fallback",
+	// Every breaker reports under its name as the dependency label; series
+	// live as long as the breaker does.
+	b, err := breaker.New("reporting-db",
 		breaker.WithFailureThreshold(2),
 		breaker.WithOpenInterval(5*time.Second, time.Minute),
 	)
 	if err != nil {
 		panic(err) // example only
 	}
-	defer b.Stop()
 
 	ctx := context.Background()
 	for range 2 {
@@ -277,34 +272,33 @@ func ExampleRegister() {
 	}
 	b.Do(ctx, func(context.Context) (int, error) { return 1, nil }) // rejected: circuit open
 
+	// Print this breaker's state gauge. The vectors are shared by every
+	// breaker in the process, so filter to our dependency label.
 	families, err := reg.Gather()
 	if err != nil {
 		panic(err)
 	}
-	enc := expfmt.NewEncoder(os.Stdout, expfmt.NewFormat(expfmt.TypeTextPlain))
 	for _, f := range families {
-		switch f.GetName() {
-		case "go_breaker_state", "go_breaker_calls_total", "go_breaker_trips_total":
-			if err := enc.Encode(f); err != nil {
-				panic(err)
+		if f.GetName() != "go_breaker_state" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			var dep, state string
+			for _, l := range m.GetLabel() {
+				switch l.GetName() {
+				case "dependency":
+					dep = l.GetValue()
+				case "state":
+					state = l.GetValue()
+				}
+			}
+			if dep == "reporting-db" {
+				fmt.Printf("go_breaker_state{dependency=%q,state=%q} %v\n", dep, state, m.GetGauge().GetValue())
 			}
 		}
 	}
 	// Output:
-	// # HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.
-	// # TYPE go_breaker_calls_total counter
-	// go_breaker_calls_total{dependency="db-fallback",result="canceled"} 0
-	// go_breaker_calls_total{dependency="db-fallback",result="denied"} 0
-	// go_breaker_calls_total{dependency="db-fallback",result="failure"} 2
-	// go_breaker_calls_total{dependency="db-fallback",result="rejected"} 1
-	// go_breaker_calls_total{dependency="db-fallback",result="shed"} 0
-	// go_breaker_calls_total{dependency="db-fallback",result="success"} 0
-	// # HELP go_breaker_state Circuit state as a one-hot gauge: exactly one state label is 1.
-	// # TYPE go_breaker_state gauge
-	// go_breaker_state{dependency="db-fallback",state="closed"} 0
-	// go_breaker_state{dependency="db-fallback",state="half-open"} 0
-	// go_breaker_state{dependency="db-fallback",state="open"} 1
-	// # HELP go_breaker_trips_total Total closed/half-open to open transitions.
-	// # TYPE go_breaker_trips_total counter
-	// go_breaker_trips_total{dependency="db-fallback"} 1
+	// go_breaker_state{dependency="reporting-db",state="closed"} 0
+	// go_breaker_state{dependency="reporting-db",state="half-open"} 0
+	// go_breaker_state{dependency="reporting-db",state="open"} 1
 }

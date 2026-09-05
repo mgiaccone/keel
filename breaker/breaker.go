@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"time"
 )
 
@@ -63,11 +64,11 @@ var (
 	// [WithMaxInFlight] or [WithAdaptiveInFlight] is reached. fn was not
 	// invoked. Callers should fail fast and not retry.
 	ErrBulkhead = errors.New("breaker: too many calls in flight")
-	// ErrStopped is returned by [Breaker.Do] after [Breaker.Stop].
-	ErrStopped = errors.New("breaker: stopped")
 	// ErrInvalidOption is wrapped by every error [New] returns for an option
 	// value that cannot be meant, such as a threshold below 1.
 	ErrInvalidOption = errors.New("breaker: invalid option")
+	// ErrStopped is returned by [Breaker.Do] after [Breaker.Stop].
+	ErrStopped = errors.New("breaker: stopped")
 )
 
 // Option configures a [Breaker]. Every setting has a documented default, so
@@ -358,7 +359,10 @@ func WithIsFailure(fn func(err error) bool) Option {
 // goroutine that answers them is the one running the hook.
 //
 // This is the natural place to log transitions, together with the name of
-// the guarded dependency. nil removes a previously set hook.
+// the guarded dependency. nil removes a previously set hook. The hook must
+// not capture the Breaker it is attached to: besides the deadlock, a
+// reference from the breaker's own configuration back to its handle would
+// keep the handle reachable forever.
 func WithOnStateChange(fn func(from, to State)) Option {
 	return func(c *config) error {
 		c.onStateChange = fn
@@ -414,8 +418,8 @@ func (r Result) String() string {
 // counters incremented here agree exactly with [Stats].
 //
 // Started is called once, from [New] before it returns, and Stopped once when
-// the state goroutine exits, after every other method; nothing is delivered
-// after Stopped. Call is delivered once per call that reached the breaker,
+// the state goroutine exits, on [Breaker.Stop] or after the Breaker has become
+// unreachable and been collected; nothing is delivered after Stopped. Call is delivered once per call that reached the breaker,
 // after its result is counted and before any transition it causes, including
 // results of calls admitted before a transition (they are counted, not acted
 // on). Transition is delivered on every state change; openUntil is the
@@ -560,13 +564,28 @@ func (s Stats) String() string {
 
 // Breaker is a channel-based circuit breaker. Create one with [New]; the zero
 // value is not usable.
+//
+// A Breaker needs no teardown. Its state goroutine runs for as long as the
+// Breaker is reachable and stops itself once it is not, the way a
+// [time.Timer] is collected without Stop since Go 1.23. A breaker created at
+// bootstrap simply lives for the process; one created for a shorter purpose is
+// dropped like any other value. [Breaker.Stop] exists for callers who want the
+// goroutine gone and the metric series removed at a moment of their choosing,
+// such as tests; calling it is optional.
 type Breaker struct {
+	*core
+}
+
+// core is the machinery the handle points to. The state goroutine holds only
+// the core, never the Breaker, which is what lets an unreachable Breaker be
+// collected and its cleanup stop the goroutine.
+type core struct {
 	cfg config
 
 	admit   chan token        // Do → loop: may I run? the loop replies on the token
 	settle  chan settleMsg    // Do → loop: here is the outcome; the loop acks on the token
 	inspect chan chan<- Stats // Stats → loop: snapshot please
-	stop    chan struct{}     // Stop → loop: exit
+	quit    chan struct{}     // stop → loop: exit
 	stopped chan struct{}     // closed by the loop on exit
 
 	// tokens is a free list of per-call channels. It is a plain buffered
@@ -611,7 +630,7 @@ type settleMsg struct {
 	tok     token         // acked with a send once the outcome is applied
 }
 
-// New starts a breaker's state goroutine and returns it. name identifies the
+// New starts a breaker and returns it. name identifies the
 // dependency the breaker guards, for example "db-fallback": it appears in
 // [Stats] and its log line and is the dependency label of the breaker's
 // Prometheus metrics (see [Register]). Each name should belong to one live
@@ -620,8 +639,7 @@ type settleMsg struct {
 //
 // If name is empty or any option is invalid, New returns an error that wraps
 // [ErrInvalidOption] and describes every problem, and no goroutine is
-// started. Call [Breaker.Stop] when the breaker is no longer needed to
-// release the goroutine.
+// started. Nothing needs to be stopped afterwards; see [Breaker].
 func New(name string, opts ...Option) (*Breaker, error) {
 	cfg := defaultConfig()
 	cfg.name = name
@@ -657,12 +675,12 @@ func New(name string, opts ...Option) (*Breaker, error) {
 		cfg.seed = [2]uint64{rand.Uint64(), rand.Uint64()}
 	}
 
-	b := &Breaker{
+	c := &core{
 		cfg:     cfg,
 		admit:   make(chan token),
 		settle:  make(chan settleMsg),
 		inspect: make(chan chan<- Stats),
-		stop:    make(chan struct{}),
+		quit:    make(chan struct{}),
 		stopped: make(chan struct{}),
 		tokens:  make(chan token, _tokenPoolSize),
 	}
@@ -672,7 +690,11 @@ func New(name string, opts ...Option) (*Breaker, error) {
 	for _, o := range cfg.observers {
 		o.Started()
 	}
-	go b.run()
+	go c.run()
+	b := &Breaker{core: c}
+	// The goroutine references c, never b, so b becomes unreachable when the
+	// caller drops it, and the cleanup stops the goroutine.
+	runtime.AddCleanup(b, (*core).stop, c)
 	return b, nil
 }
 
@@ -724,7 +746,7 @@ func (b *Breaker) Do[T any](ctx context.Context, fn func(context.Context) (T, er
 	return v, err
 }
 
-func (b *Breaker) classify(err error) outcome {
+func (b *core) classify(err error) outcome {
 	switch {
 	case b.cfg.isFailure(err):
 		return _outcomeFailure
@@ -746,7 +768,7 @@ func (b *Breaker) classify(err error) outcome {
 // counted the call as admitted and, while half-open, has handed it a probe
 // slot that would never be released. Every later call would then be rejected
 // with ErrProbeLimit and the circuit could never recover.
-func (b *Breaker) acquire(ctx context.Context) (token, uint64, error) {
+func (b *core) acquire(ctx context.Context) (token, uint64, error) {
 	// select chooses uniformly among ready cases, so without this check an
 	// already-cancelled ctx could still win admission against an idle loop.
 	if err := ctx.Err(); err != nil {
@@ -778,7 +800,7 @@ func (b *Breaker) acquire(ctx context.Context) (token, uint64, error) {
 }
 
 // getToken takes a token from the free list or allocates one.
-func (b *Breaker) getToken() token {
+func (b *core) getToken() token {
 	select {
 	case tok := <-b.tokens:
 		return tok
@@ -790,7 +812,7 @@ func (b *Breaker) getToken() token {
 // putToken returns an empty token to the free list, or drops it if the list
 // is full. Every caller has received whatever the loop sent on it, so it is
 // empty.
-func (b *Breaker) putToken(tok token) {
+func (b *core) putToken(tok token) {
 	select {
 	case b.tokens <- tok:
 	default:
@@ -812,7 +834,7 @@ func (b *Breaker) putToken(tok token) {
 // needs no barrier.
 //
 // If the breaker is stopped, the outcome is discarded.
-func (b *Breaker) release(tok token, gen uint64, out outcome, elapsed time.Duration) {
+func (b *core) release(tok token, gen uint64, out outcome, elapsed time.Duration) {
 	select {
 	case b.settle <- settleMsg{gen: gen, out: out, elapsed: elapsed, tok: tok}:
 		<-tok
@@ -821,14 +843,25 @@ func (b *Breaker) release(tok token, gen uint64, out outcome, elapsed time.Durat
 	b.putToken(tok)
 }
 
+// Stop shuts the state goroutine down now rather than when the Breaker is
+// collected. It is optional: a Breaker that is simply dropped stops itself.
+// Call it for deterministic teardown, in tests, or when the breaker's metric
+// series should disappear immediately rather than after the next garbage
+// collection. Idempotent and safe to call concurrently: the send on the
+// unbuffered quit channel is raced against stopped, so exactly one caller
+// wins and every other sees stopped close. Calls in flight complete and
+// return fn's result; their outcomes are discarded. Afterwards Do returns
+// [ErrStopped] and Stats the zero value.
+func (b *Breaker) Stop() { b.core.stop() }
+
 // State returns the current state, applying any due open → half-open
-// transition first. After Stop it returns Closed (the zero value).
+// transition first.
 func (b *Breaker) State() State {
 	return b.Stats().State
 }
 
 // Stats returns a snapshot of the breaker, applying any due open → half-open
-// transition first. After Stop it returns the zero Stats.
+// transition first.
 func (b *Breaker) Stats() Stats {
 	reply := make(chan Stats, 1)
 	select {
@@ -839,18 +872,11 @@ func (b *Breaker) Stats() Stats {
 	}
 }
 
-// Stop shuts the state goroutine down. It is idempotent and safe to call
-// concurrently; every call returns once the goroutine has exited. Calls in
-// flight complete normally and return fn's result, but their outcomes are
-// discarded. Subsequent Do calls return [ErrStopped]; Stats returns the zero
-// value.
-//
-// Idempotence without sync.Once: the send on the unbuffered stop channel is
-// raced against stopped. Exactly one caller wins the send; every other caller,
-// and every later caller, sees stopped close instead.
-func (b *Breaker) Stop() {
+// stop is Stop's implementation, on the core so the cleanup can run it
+// without a handle.
+func (b *core) stop() {
 	select {
-	case b.stop <- struct{}{}:
+	case b.quit <- struct{}{}:
 	case <-b.stopped:
 	}
 	<-b.stopped
@@ -884,7 +910,7 @@ type machine struct {
 // replies run sends. That single-owner discipline is what makes the absence
 // of locking sound, and it is also why the state-change hook must not call
 // back into the breaker.
-func (b *Breaker) run() {
+func (b *core) run() {
 	m := &machine{
 		cfg:   b.cfg,
 		rng:   rand.New(rand.NewPCG(b.cfg.seed[0], b.cfg.seed[1])),
@@ -903,7 +929,7 @@ func (b *Breaker) run() {
 			msg.tok <- 0
 		case reply := <-b.inspect:
 			reply <- m.snapshot()
-		case <-b.stop:
+		case <-b.quit:
 			for _, o := range m.cfg.observers {
 				o.Stopped()
 			}

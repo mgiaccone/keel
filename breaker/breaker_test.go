@@ -525,13 +525,10 @@ func TestStopIsIdempotentAndConcurrent(t *testing.T) {
 
 	_, err = b.Do(t.Context(), func(context.Context) (int, error) { return 1, nil })
 	if !errors.Is(err, ErrStopped) {
-		t.Fatalf("Do after Stop: err = %v, want ErrStopped", err)
+		t.Fatalf("Do after stop: err = %v, want ErrStopped", err)
 	}
 	if s := b.Stats(); s != (Stats{}) {
-		t.Fatalf("Stats after Stop = %+v, want zero", s)
-	}
-	if b.State() != Closed {
-		t.Fatalf("State after Stop = %s", b.State())
+		t.Fatalf("Stats after stop = %+v, want zero", s)
 	}
 }
 
@@ -1699,25 +1696,32 @@ func TestChaosInvariants(t *testing.T) {
 	}
 }
 
-// TestStopReleasesGoroutine checks that every breaker's state goroutine is
-// gone after Stop, so a service that creates breakers per dependency and
-// tears them down does not leak.
-func TestStopReleasesGoroutine(t *testing.T) {
+// TestDroppedBreakerStopsItself: a breaker that goes out of scope without any
+// call is collected and its state goroutine exits, so creating breakers
+// dynamically cannot leak.
+func TestDroppedBreakerStopsItself(t *testing.T) {
 	before := runtime.NumGoroutine()
-	for range 200 {
-		b, err := New("leak")
+	createAndDrop(t, 200)
+	deadline := time.Now().Add(10 * time.Second)
+	for runtime.NumGoroutine() > before {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d goroutines before, %d after dropping 200 breakers", before, runtime.NumGoroutine())
+		}
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// createAndDrop is a separate function so nothing in the caller's frame can
+// keep the breakers reachable.
+func createAndDrop(t *testing.T, n int) {
+	t.Helper()
+	for range n {
+		b, err := New("dropped")
 		if err != nil {
 			t.Fatal(err)
 		}
 		b.Do(context.Background(), func(context.Context) (int, error) { return 1, nil })
-		b.Stop()
-	}
-	deadline := time.Now().Add(5 * time.Second)
-	for runtime.NumGoroutine() > before && time.Now().Before(deadline) {
-		runtime.Gosched()
-	}
-	if n := runtime.NumGoroutine(); n > before {
-		t.Fatalf("%d goroutines before, %d after stopping 200 breakers", before, n)
 	}
 }
 

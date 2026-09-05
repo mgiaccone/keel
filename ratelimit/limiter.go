@@ -14,8 +14,8 @@ import (
 // refusal that leaves the state unchanged is not written, so refused calls
 // cost one read.
 //
-// Limiter has no goroutine and is safe for concurrent use; its counters are
-// atomics.
+// Limiter has no goroutine, needs no teardown and is safe for concurrent
+// use; its counters are atomics.
 type Limiter struct {
 	name        string
 	algorithm   Algorithm
@@ -154,6 +154,3 @@ func (l *Limiter) Stats() Stats {
 	}
 	return s
 }
-
-// Stop removes the limiter's metrics. The store is the caller's to close.
-func (l *Limiter) Stop() { l.metrics.stopped() }

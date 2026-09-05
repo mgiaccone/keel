@@ -17,6 +17,14 @@ import (
 	"github.com/mgiaccone/keel/breaker"
 )
 
+var _nameSeq atomic.Uint64
+
+// uniqueName gives a limiter a name no other run in this process has used, so
+// tests asserting absolute metric values are not confused by -count.
+func uniqueName(t *testing.T) string {
+	return fmt.Sprintf("%s#%d", t.Name(), _nameSeq.Add(1))
+}
+
 type fakeClock struct{ ns atomic.Int64 }
 
 func newFakeClock() *fakeClock {
@@ -41,11 +49,10 @@ func newHarness(t *testing.T, algo Algorithm, storeOpts ...MemoryOption) *harnes
 	if err != nil {
 		t.Fatal(err)
 	}
-	l, err := New(t.Name(), algo, store)
+	l, err := New(uniqueName(t), algo, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(l.Stop)
 	return &harness{Limiter: l, store: store, clock: clock}
 }
 
@@ -302,7 +309,6 @@ func TestLimiterRetriesConflictsThenGivesUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Stop()
 	if d, err := l.Allow(context.Background(), "k"); err != nil || !d.Allowed {
 		t.Fatalf("two conflicts within the budget: %+v %v", d, err)
 	}
@@ -334,18 +340,18 @@ func TestLimiterStoreErrorsAreNotDecisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	boom := errors.New("connection refused")
-	l, err := New("err", GCRA(1, 1), failingStore{boom})
+	name := uniqueName(t)
+	l, err := New(name, GCRA(1, 1), failingStore{boom})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Stop()
 	if _, err := l.Allow(context.Background(), ""); !errors.Is(err, boom) {
 		t.Fatalf("err = %v", err)
 	}
 	if s := l.Stats(); s.Errors != 1 || s.Allowed != 0 || s.Limited != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
-	if v := testutil.ToFloat64(_decisionsCounter.WithLabelValues("err", "gcra", "error")); v != 1 {
+	if v := testutil.ToFloat64(_decisionsCounter.WithLabelValues(name, "gcra", "error")); v != 1 {
 		t.Fatalf("error metric = %v", v)
 	}
 }
@@ -394,7 +400,6 @@ func TestCASPathUnderContention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Stop()
 	var wg sync.WaitGroup
 	var allowed atomic.Uint64
 	for range 16 {
@@ -447,7 +452,7 @@ func TestStatsString(t *testing.T) {
 	h := newHarness(t, GCRA(1, 1))
 	h.allow(t, "k")
 	h.allow(t, "k")
-	want := fmt.Sprintf("ratelimit: name=%s algorithm=gcra keys=1 allowed=1 limited=1 errors=0 conflicts=0", t.Name())
+	want := fmt.Sprintf("ratelimit: name=%s algorithm=gcra keys=1 allowed=1 limited=1 errors=0 conflicts=0", h.Stats().Name)
 	if got := h.Stats().String(); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -466,7 +471,6 @@ func TestAdmissionDeniesThroughBreaker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer b.Stop()
 	ctx := context.Background()
 	ran := 0
 	fn := func(context.Context) (int, error) { ran++; return 1, nil }
@@ -494,7 +498,6 @@ func TestAdmissionOpenCircuitDoesNotConsumeQuota(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer b.Stop()
 	ctx := context.Background()
 	b.Do(ctx, func(context.Context) (int, error) { return 0, errors.New("boom") }) // trips; used 1 token
 	h.clock.Add(time.Second)
@@ -509,15 +512,12 @@ func TestAdmissionOpenCircuitDoesNotConsumeQuota(t *testing.T) {
 func TestAdmissionFailsClosedAndFailOpenInverts(t *testing.T) {
 	boom := errors.New("store down")
 	l, _ := New("adm", GCRA(1, 1), failingStore{boom})
-	defer l.Stop()
 	closed, _ := breaker.New("closed", breaker.WithAdmission(Admission(l, "")))
-	defer closed.Stop()
 	if _, err := closed.Do(context.Background(), func(context.Context) (int, error) { return 1, nil }); !errors.Is(err, boom) {
 		t.Fatalf("fail closed: err = %v", err)
 	}
 	var seen error
 	open, _ := breaker.New("open", breaker.WithAdmission(Admission(FailOpen(l, func(err error) { seen = err }), "")))
-	defer open.Stop()
 	if _, err := open.Do(context.Background(), func(context.Context) (int, error) { return 1, nil }); err != nil {
 		t.Fatalf("fail open: err = %v", err)
 	}
@@ -535,28 +535,34 @@ func TestMetrics(t *testing.T) {
 		t.Fatal("second Register should fail")
 	}
 	store, _ := NewMemoryStore()
-	l, err := New("m", GCRA(1, 1), store)
+	name := uniqueName(t)
+	l, err := New(name, GCRA(1, 1), store)
 	if err != nil {
 		t.Fatal(err)
 	}
 	l.Allow(context.Background(), "a")
 	l.Allow(context.Background(), "a")
 	l.Allow(context.Background(), "b")
-	want := `
-# HELP go_ratelimit_cas_conflicts_total Compare-and-set retries: two writers raced on one key. Sustained conflicts mean a hot key.
-# TYPE go_ratelimit_cas_conflicts_total counter
-go_ratelimit_cas_conflicts_total{algorithm="gcra",limiter="m"} 0
-# HELP go_ratelimit_decisions_total Rate limiter decisions, by result. error is a decision that could not be made, e.g. Redis unreachable.
-# TYPE go_ratelimit_decisions_total counter
-go_ratelimit_decisions_total{algorithm="gcra",limiter="m",result="allowed"} 2
-go_ratelimit_decisions_total{algorithm="gcra",limiter="m",result="error"} 0
-go_ratelimit_decisions_total{algorithm="gcra",limiter="m",result="limited"} 1
-# HELP go_ratelimit_keys Records the limiter's store currently holds, when the store can report it.
-# TYPE go_ratelimit_keys gauge
-go_ratelimit_keys{algorithm="gcra",limiter="m"} 2
-`
-	if err := testutil.GatherAndCompare(reg, strings.NewReader(want), "go_ratelimit_cas_conflicts_total", "go_ratelimit_decisions_total", "go_ratelimit_keys"); err != nil {
-		t.Fatal(err)
+
+	// The vectors are package-level and other tests' limiters live alongside,
+	// so assert on this limiter's series rather than on the whole exposition.
+	series := func(vec *prometheus.CounterVec, labels ...string) float64 {
+		return testutil.ToFloat64(vec.WithLabelValues(labels...))
+	}
+	if got := series(_decisionsCounter, name, "gcra", "allowed"); got != 2 {
+		t.Errorf("allowed = %v, want 2", got)
+	}
+	if got := series(_decisionsCounter, name, "gcra", "limited"); got != 1 {
+		t.Errorf("limited = %v, want 1", got)
+	}
+	if got := series(_decisionsCounter, name, "gcra", "error"); got != 0 {
+		t.Errorf("error = %v, want 0", got)
+	}
+	if got := series(_conflictsCounter, name, "gcra"); got != 0 {
+		t.Errorf("conflicts = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(_keysGauge.WithLabelValues(name, "gcra")); got != 2 {
+		t.Errorf("keys = %v, want 2", got)
 	}
 	problems, err := testutil.GatherAndLint(reg)
 	if err != nil {
@@ -564,10 +570,6 @@ go_ratelimit_keys{algorithm="gcra",limiter="m"} 2
 	}
 	for _, p := range problems {
 		t.Errorf("lint: %s: %s", p.Metric, p.Text)
-	}
-	l.Stop()
-	if n, _ := testutil.GatherAndCount(reg); n != 0 {
-		t.Fatalf("%d series remain after Stop", n)
 	}
 	if err := Register(prometheus.NewPedanticRegistry(), WithNamespace("1bad")); !errors.Is(err, ErrInvalidOption) {
 		t.Fatalf("bad namespace: %v", err)
