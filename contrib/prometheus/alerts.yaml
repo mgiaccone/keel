@@ -1,5 +1,5 @@
-# Prometheus alert and recording rules for keel. See docs/breaker.md and
-# docs/ratelimit.md, "Alerting", for the reasoning behind each threshold. The
+# Prometheus alert and recording rules for keel. See docs/breaker.md,
+# docs/ratelimit.md and docs/retry.md, "Alerting", for the reasoning behind each threshold. The
 # rules assume the default metric namespace "go"; with WithNamespace, rename
 # the metrics here to match. Validate with:
 #   promtool check rules contrib/prometheus/alerts.yaml
@@ -85,4 +85,40 @@ groups:
   - alert: RateLimitErrors
     expr: sum by (limiter) (rate(go_ratelimit_decisions_total{result="error"}[5m])) > 0
     for: 2m
+    labels: { severity: page }
+
+- name: retry
+  rules:
+  # Retries per call: attempts beyond the first, over calls. Attempts are
+  # counted when they start and calls when they end, so the ratio is exact
+  # only over a window longer than a call, which 5m is.
+  - record: retry:retries_per_call
+    expr: |
+      (
+        sum by (retrier) (rate(go_retry_attempts_total[5m]))
+          -
+        sum by (retrier) (rate(go_retry_calls_total[5m]))
+      )
+        /
+      sum by (retrier) (rate(go_retry_calls_total[5m]))
+
+  # Most calls are being retried: the dependency is degraded and retries are
+  # now a large share of its load, or WithRetryIf is retrying answers. A
+  # ticket, because the attempt cap and the budget bound the damage.
+  - alert: RetryAmplifying
+    expr: retry:retries_per_call > 0.5
+    for: 10m
+    labels: { severity: ticket }
+    annotations:
+      summary: "{{ $labels.retrier }} averages {{ $value | humanize }} retries per call"
+
+  # The user-facing symptom: calls that failed after every attempt. The
+  # dependency has been down for longer than the schedule spans.
+  - alert: RetryExhausting
+    expr: |
+      sum by (retrier) (rate(go_retry_calls_total{result="exhausted"}[5m]))
+        /
+      sum by (retrier) (rate(go_retry_calls_total[5m]))
+        > 0.1
+    for: 5m
     labels: { severity: page }

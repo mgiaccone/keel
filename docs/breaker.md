@@ -277,7 +277,9 @@ not run and has no side effects. Callers should translate the three refusals
 into their own "unavailable" error at the boundary, return it to their
 clients as `503 Service Unavailable` with a `Retry-After` (for `ErrOpen`,
 `Stats.NextProbeIn`), and not retry: a retry is refused again or takes the
-probe slot recovery depends on.
+probe slot recovery depends on. The refusals answer false to the `Retryable`
+contract, so a [`retry`](retry.md) retrier stops on them without either
+package importing the other.
 
 ### Results
 
@@ -344,6 +346,21 @@ b, err := breaker.New("db-fallback",
 The veto runs after the circuit has admitted the call, so a call the circuit
 refuses consumes no quota, and a call the limiter refuses is recorded by the
 breaker as denied. The two packages do not import each other.
+
+### With a retrier
+
+The breaker goes inside the retrier, so each attempt is a breaker call:
+
+```go
+v, err := r.Do(ctx, func(ctx context.Context) (V, error) {
+    return b.Do(ctx, fn)
+})
+```
+
+`ErrOpen`, `ErrProbeLimit`, `ErrBulkhead` and `ErrStopped` implement
+`Retryable() bool` and answer false, so the retrier stops on them. The
+breaker's `WithTimeout` bounds each attempt, which the retrier needs and
+cannot do itself. See [`retry`](retry.md).
 
 ### With other telemetry
 

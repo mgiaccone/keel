@@ -465,6 +465,14 @@ func TestLimitedErrorIs(t *testing.T) {
 	if !errors.Is(err, ErrLimited) || !strings.Contains(err.Error(), "acme") {
 		t.Fatalf("err = %v", err)
 	}
+	// The contract package retry relies on: a refusal is retryable, after RetryAfter.
+	r, ok := err.(interface {
+		Retryable() bool
+		RetryDelay() time.Duration
+	})
+	if !ok || !r.Retryable() || r.RetryDelay() != time.Second {
+		t.Fatalf("retry contract: %v", err)
+	}
 }
 
 func TestAdmissionDeniesThroughBreaker(t *testing.T) {

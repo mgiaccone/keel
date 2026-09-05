@@ -9,6 +9,7 @@ Resilience primitives for Go. Requires Go 1.27.
 |---|---|
 | [`breaker`](docs/breaker.md) | What happens to calls: circuit breaker, bulkhead (static or adaptive), per-call timeout, recovery ramp, admission veto. |
 | [`ratelimit`](docs/ratelimit.md) | How fast calls start: GCRA, fixed window or sliding window over a memory or Redis store, as a `net/http` middleware or composed with the breaker. |
+| [`retry`](docs/retry.md) | How many times a call is attempted: four jittered schedules, a retry budget, `Retry-After`, an `http.RoundTripper`. |
 
 ## Install
 
@@ -44,10 +45,27 @@ limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)
 mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
 ```
 
+### Retrier
+
+```go
+r, err := retry.New("db-fallback", retry.Exponential(50*time.Millisecond, 2*time.Second),
+    retry.WithMaxAttempts(4),
+    retry.WithBudget(ratelimit.Admission(limiter, "")),      // at most so many retries per second, fleet-wide with Redis
+)
+
+row, err := r.Do(ctx, func(ctx context.Context) (Row, error) {
+    return b.Do(ctx, func(ctx context.Context) (Row, error) { return db.Get(ctx, key) })   // a breaker refusal is never retried
+})
+
+transport, err := retry.NewTransport(r, nil)                     // retries 408/429/502/503/504 on requests net/http would replay
+client := &http.Client{Transport: transport}
+```
+
 ## Documentation
 
 - [Circuit breaker](docs/breaker.md): when a breaker is the right tool, every knob and why, guarantees, metrics, alerts, dashboard, benchmarks.
 - [Rate limiter](docs/ratelimit.md): the algorithm-over-store design, algorithms, stores, Redis, the middleware, metrics, alerts, dashboard.
+- [Retrier](docs/retry.md): the bounds that keep retries safe, schedules, the budget, `Retry-After`, the HTTP replay rule, metrics, alerts, dashboard.
 
 Runnable examples with verified output live in each package's `example_test.go`;
 `CONTRIBUTING.md` has the verification commands.

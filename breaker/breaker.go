@@ -52,23 +52,39 @@ func (s State) String() string {
 	}
 }
 
+// refusal is the type of the errors Do returns without invoking fn. It
+// answers false to the Retryable() bool contract that package retry looks
+// for, so a retrier wrapping a breaker stops on a refusal without either
+// package importing the other: a retry would be refused again or take the
+// probe slot recovery depends on.
+type refusal string
+
+func (r refusal) Error() string { return string(r) }
+
+// Retryable reports false; see [refusal].
+func (refusal) Retryable() bool { return false }
+
 var (
 	// ErrOpen is returned by [Breaker.Do] while the circuit is open. fn was
-	// not invoked. Callers should fail fast and not retry.
-	ErrOpen = errors.New("breaker: circuit open")
+	// not invoked. Callers should fail fast and not retry; a retrier from
+	// package retry stops on it by contract.
+	ErrOpen error = refusal("breaker: circuit open")
 	// ErrProbeLimit is returned by [Breaker.Do] while the circuit is
 	// half-open and MaxProbes trial calls are already in flight. fn was not
-	// invoked. Callers should fail fast and not retry.
-	ErrProbeLimit = errors.New("breaker: half-open probe limit reached")
+	// invoked. Callers should fail fast and not retry; a retrier from
+	// package retry stops on it by contract.
+	ErrProbeLimit error = refusal("breaker: half-open probe limit reached")
 	// ErrBulkhead is returned by [Breaker.Do] when the in-flight limit set by
 	// [WithMaxInFlight] or [WithAdaptiveInFlight] is reached. fn was not
-	// invoked. Callers should fail fast and not retry.
-	ErrBulkhead = errors.New("breaker: too many calls in flight")
+	// invoked. Callers should fail fast and not retry; a retrier from
+	// package retry stops on it by contract.
+	ErrBulkhead error = refusal("breaker: too many calls in flight")
 	// ErrInvalidOption is wrapped by every error [New] returns for an option
 	// value that cannot be meant, such as a threshold below 1.
 	ErrInvalidOption = errors.New("breaker: invalid option")
-	// ErrStopped is returned by [Breaker.Do] after [Breaker.Stop].
-	ErrStopped = errors.New("breaker: stopped")
+	// ErrStopped is returned by [Breaker.Do] after [Breaker.Stop]. Like the
+	// other refusals it is not retryable.
+	ErrStopped error = refusal("breaker: stopped")
 )
 
 // Option configures a [Breaker]. Every setting has a documented default, so

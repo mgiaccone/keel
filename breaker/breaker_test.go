@@ -596,6 +596,20 @@ func TestStatsString(t *testing.T) {
 	}
 }
 
+// TestRefusalsAreNotRetryable pins the contract package retry relies on: every
+// error Do returns without running fn says so through Retryable() bool.
+func TestRefusalsAreNotRetryable(t *testing.T) {
+	for _, err := range []error{ErrOpen, ErrProbeLimit, ErrBulkhead, ErrStopped} {
+		r, ok := err.(interface{ Retryable() bool })
+		if !ok || r.Retryable() {
+			t.Errorf("%v: Retryable() = %v, %v; want false", err, ok, ok && r.Retryable())
+		}
+		if !errors.Is(fmt.Errorf("wrapped: %w", err), err) {
+			t.Errorf("%v: errors.Is through a wrapper failed", err)
+		}
+	}
+}
+
 func TestStateString(t *testing.T) {
 	for s, want := range map[State]string{Closed: "closed", Open: "open", HalfOpen: "half-open", State(9): "State(9)"} {
 		if got := s.String(); got != want {

@@ -95,6 +95,19 @@ func (e *LimitedError) Error() string {
 // Is makes errors.Is(err, ErrLimited) true.
 func (e *LimitedError) Is(target error) bool { return target == ErrLimited }
 
+// Retryable reports true: a refusal is "not yet", not "no". It is the
+// Retryable() bool contract package retry looks for, so a retrier stops on a
+// breaker refusal but waits on a limiter one, with no import between the
+// packages.
+func (e *LimitedError) Retryable() bool { return true }
+
+// RetryDelay returns RetryAfter. It is the RetryDelay() time.Duration
+// contract package retry looks for: a retrier waits at least this long before
+// the next attempt, unless the delay exceeds its cap, in which case the
+// refusal is terminal. It is a method because a field and a method cannot
+// share the name RetryAfter.
+func (e *LimitedError) RetryDelay() time.Duration { return e.RetryAfter }
+
 // Admission adapts a limiter to a veto function: nil when the call may
 // proceed, a [*LimitedError] when it is refused, and the limiter's own error
 // when it could not decide, which is fail closed; wrap with [FailOpen] to

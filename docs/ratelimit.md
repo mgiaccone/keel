@@ -197,6 +197,29 @@ no quota, and a call the limiter refuses is recorded by the breaker as
 denied, with no effect on the circuit's failure count, ramp or adaptive
 bulkhead. The packages do not import each other.
 
+### As a retry budget
+
+The same `Admission` value is what `retry.WithBudget` takes:
+
+```go
+r, err := retry.New("db-fallback", retry.Exponential(50*time.Millisecond, 2*time.Second),
+    retry.WithBudget(ratelimit.Admission(limiter, "")),
+)
+```
+
+Every retry asks the limiter first; a refusal ends the call. With a Redis
+store this caps the retries of the whole fleet, which is the bound that holds
+during an outage when every instance is retrying. Size it as a fraction of
+normal traffic to the dependency.
+
+### With a retrier
+
+A `*LimitedError` implements `Retryable() bool`, answering true, and
+`RetryDelay() time.Duration`, returning `RetryAfter`. A retrier that meets
+one, for example from an admission veto inside a breaker, waits at least
+`RetryAfter` before the next attempt, or gives up when that exceeds its cap.
+See [`retry`](retry.md).
+
 ### With your own store or algorithm
 
 Implement `Store` (`Get` and `CompareAndSet`, optionally `Updater` and

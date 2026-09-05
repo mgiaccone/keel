@@ -6,7 +6,7 @@ Before opening a pull request, run what CI runs:
 gofmt -l .                                   # empty
 go vet ./...
 go test -race -cpu 1,2,4 -count=2 -timeout 15m ./...   # 1 CPU is where scheduler-order bugs surface
-go test -bench . -benchmem ./breaker/ ./ratelimit/
+go test -bench . -benchmem ./breaker/ ./ratelimit/ ./retry/
 go test -v ./ratelimit/goredis/              # the Redis store against a real server: REDIS_ADDR, or a Valkey container via docker
 ```
 
