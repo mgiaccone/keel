@@ -3,21 +3,22 @@
 [![ci](https://github.com/mgiaccone/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/mgiaccone/keel/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/mgiaccone/keel.svg)](https://pkg.go.dev/github.com/mgiaccone/keel)
 
-Resilience primitives for Go, built for the person on call: every state is
-readable in one log line and one metric, and every knob's doc says what goes
-wrong if you set it badly. State lives in a single goroutine reached through
-channels; no mutexes, no atomics, no timers in the cores. Requires Go 1.27.
+Resilience primitives for Go. Requires Go 1.27.
 
 | Package | Bounds |
 |---|---|
 | [`breaker`](docs/breaker.md) | What happens to calls: circuit breaker, bulkhead (static or adaptive), per-call timeout, recovery ramp, admission veto. |
 | [`ratelimit`](docs/ratelimit.md) | How fast calls start: GCRA, fixed window or sliding window over a memory or Redis store, as a `net/http` middleware or composed with the breaker. |
 
+## Install
+
 ```sh
 go get github.com/mgiaccone/keel@latest
 ```
 
-## Circuit breaker
+## Quick start
+
+### Circuit breaker
 
 ```go
 b, err := breaker.New("db-fallback",
@@ -34,7 +35,7 @@ if errors.Is(err, breaker.ErrOpen) || errors.Is(err, breaker.ErrBulkhead) {
 }
 ```
 
-## Rate limiter
+### Rate limiter
 
 ```go
 store, err := ratelimit.NewMemoryStore()                          // or goredis.NewStore(client) for one quota fleet-wide
