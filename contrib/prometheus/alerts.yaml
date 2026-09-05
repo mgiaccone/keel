@@ -1,5 +1,7 @@
-# Prometheus alert and recording rules for keel. See README.md, "Alerting",
-# for the reasoning behind each threshold. Validate with:
+# Prometheus alert and recording rules for keel. See docs/breaker.md and
+# docs/ratelimit.md, "Alerting", for the reasoning behind each threshold. The
+# rules assume the default metric namespace "go"; with WithNamespace, rename
+# the metrics here to match. Validate with:
 #   promtool check rules contrib/prometheus/alerts.yaml
 groups:
 - name: breaker
@@ -56,7 +58,8 @@ groups:
     labels: { severity: ticket }
 
   # Guard: a forgotten Register or a service that never created the breaker
-  # looks exactly like "everything is fine".
+  # looks exactly like "everything is fine". "db-fallback" is a placeholder:
+  # one such rule per dependency you expect to see.
   - alert: BreakerMetricsAbsent
     expr: absent(go_breaker_state{dependency="db-fallback"})
     for: 10m

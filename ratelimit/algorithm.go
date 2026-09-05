@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"fmt"
 	"math"
+	"math/bits"
 	"time"
 )
 
@@ -58,6 +59,12 @@ func (g gcra) Validate() error {
 	}
 	if g.interval() < 1 {
 		return fmt.Errorf("%w: GCRA: rate %v is too high to represent", ErrInvalidOption, g.rate)
+	}
+	// The bucket's span, burst × interval, and the TTL, twice that, must fit
+	// in int64 nanoseconds; past that the tolerance in Step and the TTL wrap
+	// negative and the limit silently stops being enforced.
+	if int64(g.burst) > math.MaxInt64/2/g.interval() {
+		return fmt.Errorf("%w: GCRA: burst %d at rate %v does not fit in a time.Duration", ErrInvalidOption, g.burst, g.rate)
 	}
 	return nil
 }
@@ -174,23 +181,54 @@ func (s slidingWindow) Step(st State, now time.Time) (State, Decision) {
 	default: // more than one window has passed: nothing recent remains
 		prev, cur = 0, 0
 	}
-	frac := float64(t-start) / float64(w)
-	est := float64(prev)*(1-frac) + float64(cur)
-	limit := float64(s.limit)
-	if est+1 <= limit {
-		return State{A: start, B: cur + 1, C: prev}, Decision{Allowed: true, Remaining: int(limit - est - 1)}
+	// A record from a store must be non-negative; treat anything else as
+	// empty rather than feeding it to the unsigned arithmetic below.
+	cur, prev = max(cur, 0), max(prev, 0)
+
+	// The estimate is prev × (1 − elapsed/w) + cur. Everything is kept as
+	// integers scaled by w, so the boundary is exact: a call made at exactly
+	// RetryAfter is admitted. In float64 the estimate could land a rounding
+	// error above the limit, refusing that call with a RetryAfter of zero.
+	elapsed := t - start
+	room := int64(s.limit) - cur - 1 // calls left in the window before the decayed previous is counted
+	if room >= 0 && mulLE(prev, w-elapsed, room, w) {
+		remaining := room - ceilMulDiv(prev, w-elapsed, w)
+		return State{A: start, B: cur + 1, C: prev}, Decision{Allowed: true, Remaining: int(remaining)}
 	}
-	remainingInWindow := time.Duration(start + w - t)
-	var wait time.Duration
-	if float64(cur)+1 <= limit {
-		// Enough of previous must decay: previous×(1−f') ≤ limit−1−current.
-		need := 1 - (limit-1-float64(cur))/float64(prev)
-		wait = time.Duration((need - frac) * float64(w))
+	var wait int64
+	if room >= 0 {
+		// prev > 0 here, or the call would have been admitted. It must decay
+		// to prev × (w − elapsed′) ≤ room × w, so elapsed′ = w − ⌊room×w/prev⌋.
+		wait = w - mulDiv(room, w, prev) - elapsed
 	} else {
-		// current alone exceeds the limit: wait for the boundary, then for
-		// current, as the new previous, to decay: current×(1−f) ≤ limit−1.
-		f := 1 - (limit-1)/float64(cur)
-		wait = remainingInWindow + time.Duration(f*float64(w))
+		// The current window alone exceeds the limit: wait for the boundary,
+		// then for cur, as the new previous, to decay to
+		// cur × (w − elapsed″) ≤ (limit − 1) × w.
+		wait = (w - elapsed) + w - mulDiv(int64(s.limit)-1, w, cur)
 	}
-	return st, Decision{RetryAfter: time.Duration(math.Ceil(float64(wait)))}
+	return st, Decision{RetryAfter: time.Duration(wait)}
+}
+
+// mulLE reports whether a×b ≤ c×d for non-negative operands, without
+// overflowing.
+func mulLE(a, b, c, d int64) bool {
+	h1, l1 := bits.Mul64(uint64(a), uint64(b))
+	h2, l2 := bits.Mul64(uint64(c), uint64(d))
+	return h1 < h2 || h1 == h2 && l1 <= l2
+}
+
+// mulDiv returns ⌊a×b/c⌋ for non-negative a and b and positive c. The
+// callers guarantee a×b < c×2⁶⁴, which is what bits.Div64 requires.
+func mulDiv(a, b, c int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	q, _ := bits.Div64(hi, lo, uint64(c))
+	return int64(q)
+}
+
+// ceilMulDiv returns ⌈a×b/c⌉ under the same conditions as mulDiv.
+func ceilMulDiv(a, b, c int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	lo, carry := bits.Add64(lo, uint64(c-1), 0)
+	q, _ := bits.Div64(hi+carry, lo, uint64(c))
+	return int64(q)
 }

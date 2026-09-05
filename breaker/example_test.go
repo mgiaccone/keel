@@ -265,6 +265,10 @@ func ExampleRegister() {
 	if err != nil {
 		panic(err) // example only
 	}
+	// Stop removes the series by dependency label. Without it, a dropped
+	// breaker's cleanup would do the same at some later point, and a second
+	// run of this example under -count could find its series gone.
+	defer b.Stop()
 
 	ctx := context.Background()
 	for range 2 {

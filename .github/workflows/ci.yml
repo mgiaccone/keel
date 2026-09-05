@@ -46,4 +46,4 @@ jobs:
         run: go test -race -cpu 1,2,4 -count=2 -timeout 15m ./...
 
       - name: benchmarks compile and run once
-        run: go test -run '^$' -bench . -benchtime=1x ./breaker/
+        run: go test -run '^$' -bench . -benchtime=1x ./breaker/ ./ratelimit/

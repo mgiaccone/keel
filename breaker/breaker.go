@@ -193,8 +193,9 @@ func WithOpenJitter(fraction float64) Option {
 // that hangs while the circuit is half-open holds the probe slot and nothing
 // can free it. With a timeout, a hung backend becomes a
 // context.DeadlineExceeded, which IsFailure counts as a failure by default, so
-// the circuit trips instead of wedging. The timeout starts when the call is
-// admitted, not when Do is entered.
+// the circuit trips instead of wedging. The timeout starts once the call is
+// admitted and any [WithAdmission] veto has returned, not when Do is entered;
+// the veto itself runs against the caller's context.
 //
 // fn must honour its context. The breaker cannot abort fn; Do returns only
 // when fn does, whatever the timeout says, so a fn that ignores cancellation
@@ -320,7 +321,8 @@ func WithAdmission(fn func(context.Context) error) Option {
 
 // WithIsFailure sets the predicate that decides whether an error returned by
 // fn counts against the circuit. It is the most consequential setting and
-// should be set for every backend.
+// should be set for every backend. It is called once per admitted call with
+// fn's error, nil included, so it must return false for nil.
 //
 // Default: err != nil && !errors.Is(err, context.Canceled). That is, any error
 // other than a caller-side cancellation is a failure, including
@@ -459,8 +461,8 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
-// WithSeed seeds the jitter RNG. By default it is seeded from the runtime; a
-// fixed seed makes jittered intervals reproducible.
+// WithSeed seeds the jitter RNG. The default, (0, 0), seeds it from the
+// runtime; any other pair makes jittered intervals reproducible.
 func WithSeed(a, b uint64) Option {
 	return func(c *config) error {
 		c.seed = [2]uint64{a, b}
@@ -572,6 +574,11 @@ func (s Stats) String() string {
 // dropped like any other value. [Breaker.Stop] exists for callers who want the
 // goroutine gone and the metric series removed at a moment of their choosing,
 // such as tests; calling it is optional.
+//
+// Either form of teardown waits for the state goroutine to exit, and that
+// goroutine runs the state-change hook and the observers. One that blocks
+// delays Stop and, for a dropped breaker, holds up the runtime's cleanup
+// goroutine, which every cleanup in the process shares.
 type Breaker struct {
 	*core
 }
@@ -634,8 +641,9 @@ type settleMsg struct {
 // dependency the breaker guards, for example "db-fallback": it appears in
 // [Stats] and its log line and is the dependency label of the breaker's
 // Prometheus metrics (see [Register]). Each name should belong to one live
-// breaker at a time; two live breakers with the same name would merge their
-// metrics. Options are applied in order; see [Option].
+// breaker at a time: two live breakers with the same name merge their
+// metrics, and stopping either removes the series of both, since removal is
+// by dependency label. Options are applied in order; see [Option].
 //
 // If name is empty or any option is invalid, New returns an error that wraps
 // [ErrInvalidOption] and describes every problem, and no goroutine is

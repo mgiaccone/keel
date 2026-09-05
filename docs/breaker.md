@@ -87,9 +87,10 @@ All mutable state belongs to one goroutine started by `New`. A call to `Do`
 sends an admission request over an unbuffered channel and receives the
 decision on a per-call reply channel; after `fn` returns, it sends the outcome
 and waits for the goroutine to acknowledge that the outcome has been applied.
-`Stats` and `State` are answered by the same goroutine. There are no mutexes,
-atomics or timers in the package; the goroutine reads an injectable clock
-when a message arrives.
+`Stats` and `State` are answered by the same goroutine. The core has no
+mutexes, atomics or timers; the goroutine reads an injectable clock when a
+message arrives. `WithTimeout` adds a timer per call through
+`context.WithTimeout`, and the Prometheus counters use atomics.
 
 The acknowledgement on settle gives `Do` its main guarantee: when `Do`
 returns, the outcome has been applied. A `Stats` call made afterwards reflects
@@ -134,10 +135,17 @@ the breaker's metric series immediately rather than after the next garbage
 collection. After `Stop`, `Do` returns `ErrStopped` and `Stats` the zero
 value.
 
+Either form of teardown waits for the goroutine to exit, and the goroutine
+runs the state-change hook and the observers. One that blocks delays `Stop`
+and, for a dropped breaker, holds up the runtime's cleanup goroutine, which
+every cleanup in the process shares.
+
 ## Configuration
 
 `New` takes the breaker's name and functional options. The name identifies
-the dependency in `Stats`, the log line and the `dependency` metric label. An
+the dependency in `Stats`, the log line and the `dependency` metric label.
+Each name should belong to one live breaker at a time: two with the same name
+merge their metrics, and stopping either removes the series of both. An
 option given a value that cannot be meant makes `New` return an error
 wrapping `ErrInvalidOption` that lists every such option.
 
@@ -157,18 +165,19 @@ wrapping `ErrInvalidOption` that lists every such option.
 | `WithOnStateChange(fn)` | none | Called on every transition, on the state goroutine. |
 | `WithObserver(o)` | none | Receives every event; see Composing. |
 | `WithClock(fn)` | `time.Now` | Clock for open deadlines and call durations. |
-| `WithSeed(a, b)` | random | Seed for the jitter generator. |
+| `WithSeed(a, b)` | random | Seed for the jitter generator; `(0, 0)`, the default, seeds from the runtime. |
 
 ### `WithIsFailure`
 
 The default classifies every non-nil error as a failure except
-`context.Canceled`. It must be replaced for any real dependency, because the
-default counts errors that are correct answers: `sql.ErrNoRows`, an HTTP 404,
-a validation rejection. Those mean the dependency answered; counting them as
-failures opens the circuit on healthy traffic, and no other option
-compensates. The predicate should return true only for errors that indicate
-the dependency itself is unhealthy: timeouts, connection failures, 5xx
-responses.
+`context.Canceled`. The predicate receives every admitted call's error, nil
+included, and must return false for nil. It must be replaced for any real
+dependency, because the default counts errors that are correct answers:
+`sql.ErrNoRows`, an HTTP 404, a validation rejection. Those mean the
+dependency answered; counting them as failures opens the circuit on healthy
+traffic, and no other option compensates. The predicate should return true
+only for errors that indicate the dependency itself is unhealthy: timeouts,
+connection failures, 5xx responses.
 
 `context.DeadlineExceeded` is a failure by default. A dependency too slow to
 answer within its deadline is what the breaker exists to detect.
@@ -245,8 +254,9 @@ while the circuit is half-open holds the only probe slot and nothing can
 free it. `WithTimeout` derives the context passed to `fn` from the caller's
 with an added deadline, so a hung dependency becomes
 `context.DeadlineExceeded`, which is a failure, and the circuit trips. The
-timeout starts when the call is admitted. `fn` must honour its context; the
-breaker cannot abort `fn`, and `Do` returns only when `fn` does.
+timeout starts once the call is admitted and the admission veto, if any, has
+returned; the veto runs against the caller's context. `fn` must honour its
+context; the breaker cannot abort `fn`, and `Do` returns only when `fn` does.
 
 ## Behaviour
 

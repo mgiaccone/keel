@@ -30,7 +30,7 @@ b, err := breaker.New("db-fallback",
 )
 
 row, err := b.Do(ctx, func(ctx context.Context) (Row, error) { return db.Get(ctx, key) })
-if errors.Is(err, breaker.ErrOpen) || errors.Is(err, breaker.ErrBulkhead) {
+if errors.Is(err, breaker.ErrOpen) || errors.Is(err, breaker.ErrProbeLimit) || errors.Is(err, breaker.ErrBulkhead) {
     // fail fast; the call never ran
 }
 ```

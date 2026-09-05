@@ -137,7 +137,7 @@ http.Handler`. `key` is a `KeyFunc`:
 |---|---|---|
 | `Allowed` | true | false |
 | `Remaining` | calls the key can still make now | 0 |
-| `RetryAfter` | 0 | time until a call for this key would be allowed, at least 1ms |
+| `RetryAfter` | 0 | time until a call for this key would be allowed; always positive, and exact: a call made then is admitted |
 
 Nothing waits: a refused call returns immediately. Callers that want to wait
 do so themselves, with their own deadline, using `RetryAfter`.

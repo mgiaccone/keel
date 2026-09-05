@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -184,6 +185,7 @@ func TestAlgorithmValidation(t *testing.T) {
 		"GCRA rate inf":       GCRA(math.Inf(1), 1),
 		"GCRA rate too high":  GCRA(1e12, 1),
 		"GCRA burst 0":        GCRA(1, 0),
+		"GCRA span overflows": GCRA(1e-6, 100000), // 100000 × 11.6 days does not fit int64 ns
 		"FixedWindow limit":   FixedWindow(0, time.Second),
 		"FixedWindow window":  FixedWindow(1, 0),
 		"SlidingWindow limit": SlidingWindow(0, time.Second),
@@ -573,6 +575,76 @@ func TestMetrics(t *testing.T) {
 	}
 	if err := Register(prometheus.NewPedanticRegistry(), WithNamespace("1bad")); !errors.Is(err, ErrInvalidOption) {
 		t.Fatalf("bad namespace: %v", err)
+	}
+}
+
+// TestRetryAfterIsExactForEveryAlgorithm pins the contract Decision documents:
+// a call one nanosecond before RetryAfter is refused, a call at RetryAfter is
+// admitted.
+func TestRetryAfterIsExactForEveryAlgorithm(t *testing.T) {
+	base := time.Unix(1_700_000_040, 0)
+	for name, alg := range map[string]Algorithm{
+		"gcra":           GCRA(10, 3),
+		"fixed_window":   FixedWindow(2, time.Minute),
+		"sliding_window": SlidingWindow(4, time.Minute),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var s State
+			var d Decision
+			for d.Allowed = true; d.Allowed; {
+				s, d = alg.Step(s, base)
+			}
+			if d.RetryAfter <= 0 {
+				t.Fatalf("RetryAfter = %s on a refusal", d.RetryAfter)
+			}
+			if _, early := alg.Step(s, base.Add(d.RetryAfter-time.Nanosecond)); early.Allowed {
+				t.Fatalf("admitted 1ns before RetryAfter %s", d.RetryAfter)
+			}
+			if _, then := alg.Step(s, base.Add(d.RetryAfter)); !then.Allowed {
+				t.Fatalf("still refused at RetryAfter %s", d.RetryAfter)
+			}
+		})
+	}
+}
+
+// TestSlidingWindowRetryAfterIsExact drives random limits, windows and traffic
+// shapes to a refusal and checks the same contract at each. The float64
+// formulation this replaced landed a rounding error above the limit at the
+// boundary in about one refusal in six, refusing the retry with a RetryAfter
+// of zero.
+func TestSlidingWindowRetryAfterIsExact(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	refused := 0
+	for range 20000 {
+		limit := 1 + rng.IntN(50)
+		w := time.Duration(1+rng.IntN(120)) * time.Second
+		alg := SlidingWindow(limit, w)
+		base := time.Unix(1_700_000_040, 0).Truncate(w)
+		var s State
+		for range rng.IntN(limit + 1) { // some calls spread over the previous window
+			s, _ = alg.Step(s, base.Add(time.Duration(rng.Int64N(int64(w)))))
+		}
+		now := base.Add(w + time.Duration(rng.Int64N(int64(w))))
+		for range rng.IntN(limit + 3) { // and some at one instant of the current one
+			s, _ = alg.Step(s, now)
+		}
+		_, d := alg.Step(s, now)
+		if d.Allowed {
+			continue
+		}
+		refused++
+		if d.RetryAfter <= 0 {
+			t.Fatalf("limit=%d window=%s state=%+v: RetryAfter = %s", limit, w, s, d.RetryAfter)
+		}
+		if _, early := alg.Step(s, now.Add(d.RetryAfter-time.Nanosecond)); early.Allowed {
+			t.Fatalf("limit=%d window=%s state=%+v: admitted 1ns before RetryAfter %s", limit, w, s, d.RetryAfter)
+		}
+		if _, then := alg.Step(s, now.Add(d.RetryAfter)); !then.Allowed {
+			t.Fatalf("limit=%d window=%s state=%+v: still refused at RetryAfter %s, next %s", limit, w, s, d.RetryAfter, then.RetryAfter)
+		}
+	}
+	if refused < 1000 {
+		t.Fatalf("only %d refusals exercised", refused)
 	}
 }
 
