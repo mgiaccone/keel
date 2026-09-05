@@ -46,9 +46,8 @@ mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Ke
 
 ## Documentation
 
-- [Circuit breaker](docs/breaker.md): when a breaker is the right tool, every knob and why, guarantees, benchmarks.
-- [Rate limiter](docs/ratelimit.md): the algorithm-over-store design, algorithms, stores, Redis, the middleware.
-- [Observability](docs/observability.md): metrics, alert rules, the Grafana dashboard.
+- [Circuit breaker](docs/breaker.md): when a breaker is the right tool, every knob and why, guarantees, metrics, alerts, dashboard, benchmarks.
+- [Rate limiter](docs/ratelimit.md): the algorithm-over-store design, algorithms, stores, Redis, the middleware, metrics, alerts, dashboard.
 - [Development](docs/development.md): how it is tested and how to verify a change.
 
 Runnable examples with verified output live in each package's `example_test.go`.

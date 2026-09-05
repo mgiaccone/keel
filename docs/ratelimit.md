@@ -1,8 +1,7 @@
 # ratelimit
 
 The rate limiter package: `github.com/mgiaccone/keel/ratelimit`, with the Redis
-store in `github.com/mgiaccone/keel/ratelimit/goredis`. Companion documents:
-[observability](observability.md) for metrics, alerts and the dashboard,
+store in `github.com/mgiaccone/keel/ratelimit/goredis`. See
 [development](development.md) for how it is tested.
 
 A rate limiter bounds how many calls *start* per unit of time, however fast
@@ -97,3 +96,53 @@ it against a real server: `REDIS_ADDR` if set, otherwise a disposable
 `valkey/valkey:8-alpine` container started with the `docker` CLI (image
 overridable with `RATELIMIT_TEST_IMAGE`) and removed afterwards; skipped when
 Docker is unavailable.
+
+## Observability
+
+### Metrics
+
+Metrics, registered once at bootstrap alongside the breaker's and namespaced
+the same way:
+
+```go
+breaker.Register(prometheus.DefaultRegisterer)
+ratelimit.Register(prometheus.DefaultRegisterer)   // go_ratelimit_*
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `go_ratelimit_decisions_total` | counter | `limiter`, `algorithm`, `result` ∈ allowed, limited, error |
+| `go_ratelimit_cas_conflicts_total` | counter | `limiter`, `algorithm` |
+| `go_ratelimit_keys` | gauge, when the store can report it | `limiter`, `algorithm` |
+
+Keys are deliberately not a label: per-tenant or per-IP keys would be
+unbounded cardinality. Aggregate per limiter, and use the breaker's
+`result="denied"` for the per-dependency view.
+
+### Alerting
+
+The rules live in `contrib/prometheus/alerts.yaml`, in the `ratelimit` group,
+ready for `promtool check rules`.
+
+| Rule | Severity | Fires when |
+|---|---|---|
+| `RateLimitRefusingMajority` | ticket | more than half of decisions refused for 10m |
+| `RateLimitErrors` | page | a limiter could not decide: its store is unreachable, and the middleware fails open |
+
+The first is a ticket: on an inbound limiter it means a client is being
+throttled hard, on an outbound one that you are over quota; either way
+someone should look at who and at whether the quota is right. The second is a
+page, because with the fail-open default in `Middleware` a limiter that cannot
+decide is the only signal that limits are not being enforced.
+
+### Dashboard
+
+`contrib/grafana/keel.json`, the dashboard shared with the breaker, has a
+collapsed "Rate limiters" row filtered by the `Limiter` variable:
+
+| Panel | Type | Shows |
+|---|---|---|
+| Decisions per second, by result | time series, stacked | Total height is demand; the limited band is what the quota turns away. |
+| Refused share | time series | Limited decisions over all decisions, per limiter. |
+| Limiter errors | time series | Decisions that could not be made. With the fail-open middleware this is the only sign limits are not enforced. |
+| Keys tracked | bar gauge | Records each memory store holds, bounded by `WithMaxKeys`. Not reported for Redis stores. |
