@@ -46,11 +46,11 @@ type KeyCounter interface {
 // A distributed store cannot offer it, since fn cannot run inside Redis;
 // that is what CompareAndSet is for.
 //
-// Update calls fn once with the key's current state (zero if absent or
-// expired) and the store's time, writes the returned state if it differs, and
-// returns fn's decision.
+// Update steps the algorithm once against the key's current state (zero if
+// absent or expired) at the store's time, writes the new state if it differs
+// with the algorithm's TTL, and returns the decision.
 type Updater interface {
-	Update(ctx context.Context, key string, ttl time.Duration, fn func(State, time.Time) (State, Decision)) (Decision, error)
+	Update(ctx context.Context, key string, algorithm Algorithm) (Decision, error)
 }
 
 // MemoryStore is a process-local [Store]: a map of records guarded by a
@@ -170,7 +170,7 @@ func (m *MemoryStore) CompareAndSet(_ context.Context, key string, expect uint64
 
 // Update implements [Updater]: the step runs under the store's lock, so no
 // two callers ever race on a key.
-func (m *MemoryStore) Update(_ context.Context, key string, ttl time.Duration, fn func(State, time.Time) (State, Decision)) (Decision, error) {
+func (m *MemoryStore) Update(_ context.Context, key string, algorithm Algorithm) (Decision, error) {
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -183,7 +183,7 @@ func (m *MemoryStore) Update(_ context.Context, key string, ttl time.Duration, f
 	if ok {
 		current = r.state
 	}
-	next, d := fn(current, now)
+	next, d := algorithm.Step(current, now)
 	if next == current {
 		if ok {
 			m.lru.MoveToFront(r.elem)
@@ -201,7 +201,7 @@ func (m *MemoryStore) Update(_ context.Context, key string, ttl time.Duration, f
 	} else {
 		m.lru.MoveToFront(r.elem)
 	}
-	r.state, r.version, r.expires = next, m.version, now.Add(ttl)
+	r.state, r.version, r.expires = next, m.version, now.Add(algorithm.TTL())
 	return d, nil
 }
 

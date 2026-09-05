@@ -1,112 +1,220 @@
-# ratelimit
+# Rate Limiter
 
-The rate limiter package: `github.com/mgiaccone/keel/ratelimit`, with the Redis
-store in `github.com/mgiaccone/keel/ratelimit/goredis`.
+Package `github.com/mgiaccone/keel/ratelimit`, with a Redis store in
+`github.com/mgiaccone/keel/ratelimit/goredis`. A keyed rate limiter built from
+an algorithm applied to records in a store, with a `net/http` middleware.
 
-A rate limiter bounds how many calls *start* per unit of time, however fast
-they complete; the bulkhead bounds how many are *outstanding*. It stands on
-its own: hold API clients to their quotas in a middleware, pace a worker
-against a third party, or compose it with the breaker on an outbound path.
+## Quick start
 
 ```go
-// A limiter is an algorithm applied to records in a store.
-store, err := ratelimit.NewMemoryStore()                    // per instance
-store    := goredis.NewStore(client)                        // or one quota across the fleet
-limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   // 100/s per key, bursts of 20; nothing to close
+store, err := ratelimit.NewMemoryStore()      // per process; goredis.NewStore(client) for one quota across instances
+limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   // 100 per second per key, bursts of 20
 
-// Inbound, as a plain net/http middleware: allowed requests carry
-// X-RateLimit-Remaining; refused ones get Retry-After and 429.
+// As middleware: allowed requests get X-RateLimit-Remaining; refused ones get
+// Retry-After and 429 Too Many Requests.
 mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
 
-// Or decide by hand.
+// Or directly.
 d, err := limiter.Allow(ctx, key)   // d.Allowed, d.Remaining, d.RetryAfter
-
-// Outbound: compose with a breaker; refused calls are recorded as denied.
-b, err := breaker.New("db-fallback",
-    breaker.WithAdmission(ratelimit.Admission(limiter, "")),   // "" = one limit for the whole dependency
-    ...
-)
 ```
 
-## Architecture
+`ratelimit/example_test.go` contains a middleware example and a breaker
+composition example, both with verified output.
+
+## When to use it
+
+A rate limiter bounds how many calls start per unit of time, regardless of
+how long they take. It applies in two directions:
+
+- **Inbound**, to hold callers to a quota: so many requests per second per
+  API key, tenant or client address. A refusal is `429 Too Many Requests`;
+  the caller exceeded a limit that applies to them.
+- **Outbound**, to pace calls to a dependency that has a quota or a capacity
+  you must not exceed. A refusal here is your own capacity decision, and
+  becomes `503 Service Unavailable` at your boundary.
+
+It does not bound how many calls are in progress at once; that is the
+breaker's bulkhead. Fast calls pass through a small concurrency cap at a high
+rate, and slow calls fill it at a low one. The two limits are independent.
+
+## How it works
+
+A `Limiter` is an `Algorithm` applied to records in a `Store`.
 
 ```
-Algorithm   the rule, a pure function:  Step(state, now) → (state', decision)
-Store       where a key's state lives:   Get(key) → (state, version, now)
-                                          CompareAndSet(key, version, state', ttl)
+Algorithm   the rule, as a pure function:   Step(state, now) → (state', decision)
+Store       where a key's state lives:      Get(key) → (state, version, now)
+                                             CompareAndSet(key, version, state', ttl)
 Limiter     Get, Step, CompareAndSet; retry on a version conflict
 ```
 
-An algorithm is written once, in Go, as a pure function over three integers
-of state, and works against every store. A store knows nothing about rates:
-it keeps those integers per key, swaps them atomically by version, expires
-idle records, and owns the clock, so a fleet sharing a Redis store agrees on
-time. Adding an algorithm is one pure function; adding a store is one `Get`
-and one `CompareAndSet`, verified by the contract suite in
-`ratelimit/storetest`.
+An algorithm is a function of a key's current state and the time. The state
+is three integers whose meaning the algorithm defines; the zero state means
+the key has never been seen. Algorithms are written once, in Go, and work
+against every store.
 
-| Algorithm | Guarantees | State | Trade-off |
-|---|---|---|---|
-| `GCRA(rate, burst)` | long-run average `rate`, bursts to `burst`; exactly a token bucket | 1 timestamp | The default for protecting a backend or pacing a client. |
-| `FixedWindow(limit, window)` | `limit` per aligned window | start, count | Simplest to state as a quota; admits up to 2×`limit` across a boundary. |
-| `SlidingWindow(limit, window)` | ≈`limit` in any window, from two aligned counters | start, current, previous | No boundary burst; a few percent off under uneven traffic. |
+A store keeps the state per key and updates it atomically. `Get` returns the
+record with a version, 0 for an absent key, and the store's current time.
+`CompareAndSet` writes only if the version is still the one the caller read,
+and sets the record to expire after the algorithm's TTL, after which the zero
+state gives the same answers. Two limiters racing on a key see one write
+succeed and one fail; the loser reads again and retries, up to
+`WithMaxAttempts` times, then returns `ErrContention`.
 
-| Store | Scope | Cost per decision | Notes |
-|---|---|---|---|
-| `NewMemoryStore()` | one process | a mutex; the step runs under it, so no conflicts | LRU-evicted beyond `WithMaxKeys`; injectable clock for tests. |
-| `goredis.NewStore(client)` | fleet-wide | 2 round trips: pipelined `TIME`+`HMGET`, then one Lua compare-and-set | Server time; records expire on the algorithm's TTL; Redis 5+ or Valkey. |
+A store that can apply the step under its own lock implements the optional
+`Updater` interface, and the limiter calls that instead. The memory store
+does, so a local limiter never sees a conflict. A Redis store cannot run Go
+inside Redis, so it uses compare-and-set: two round trips per decision, one
+pipelined `TIME` and `HMGET`, then one Lua script that checks the version and
+writes.
+
+The store owns the clock. With the Redis store, time comes from the Redis
+server, so instances with skewed clocks agree.
 
 A refusal that leaves the state unchanged is not written, so refused calls
-cost one read. On a distributed store two writers racing on one key see one
-succeed and one retry; `WithMaxAttempts` bounds the retries, after which
-`Allow` returns `ErrContention`, and `go_ratelimit_cas_conflicts_total` counts
-them. A store that can apply the step under its own lock implements the
-optional `Updater` and never conflicts; the memory store does.
+cost one read.
 
-## Decisions and errors
+## Configuration
 
-A refused call gets a `Decision` with `RetryAfter`, computed honestly by each
-algorithm for its own rule and what the `Retry-After` header should say;
-through `Admission` it is a `*LimitedError` matching `ErrLimited`. Nothing
-waits: a call over the limit is refused immediately.
+### Algorithms
 
-A store error is "could not decide", not "not allowed". `Allow` returns it,
-`Stats.Errors` and `result="error"` count it, `Admission` fails closed and
-`FailOpen(limiter, onError)` inverts that. The middleware fails open by
-default, because an API that goes down with its Redis is usually the worse
-outcome; `FailClosed()` answers 503 instead.
+| Constructor | Allows | State | Notes |
+|---|---|---|---|
+| `GCRA(rate, burst)` | `rate` calls per second on average, bursts up to `burst` | one timestamp | Decisions are exactly those of a token bucket. The usual choice for protecting a dependency or pacing a client. |
+| `FixedWindow(limit, window)` | `limit` calls per window aligned to the epoch | start, count | Matches a quota stated as "N per minute". Admits up to 2×`limit` across a window boundary. |
+| `SlidingWindow(limit, window)` | about `limit` calls in any window-long span | start, current, previous | Estimates the count from two aligned windows, assuming the previous window's calls were evenly spread; no boundary burst; a few percent off under uneven traffic. |
 
-Inbound, a refusal is a 429 because the client exceeded a quota that is
-theirs; outbound through the breaker it is your own capacity and becomes a
-503 at your boundary. The limiter does not know which.
+`RetryAfter` in a refusal is computed by each algorithm for its own rule:
+GCRA, the time until one token has refilled; fixed window, the time to the
+next boundary; sliding window, the time until the estimate, with no further
+calls, falls below the limit.
 
-`Middleware` takes a `KeyFunc`: `KeyByHeader("X-API-Key")`,
-`KeyByRemoteAddr()`, `KeyGlobal()`, or your own that reads the authenticated
-tenant from the context. Options: `WithLimitedHandler` for a custom 429 body,
-`OnError` for logging, `WithoutRemainingHeader` for endpoints that should not
-reveal their limits.
+### Stores
 
-## Testing
+| Constructor | Scope | Options |
+|---|---|---|
+| `NewMemoryStore(opts...)` | one process | `WithMaxKeys(n)`, default 1024: records kept, least recently used evicted beyond it. `WithClock(fn)`, default `time.Now`. |
+| `goredis.NewStore(client, opts...)` | shared through Redis | `WithKeyPrefix(p)`, default `ratelimit:`; include a hash tag such as `ratelimit:{public-api}:` to keep a limiter's keys in one cluster slot. |
 
-Algorithms are tested as pure functions with explicit times. Stores run the
-contract in `ratelimit/storetest`: absent keys, create, version conflicts,
-expiry, and lost-update-free concurrent compare-and-set. The Redis store runs
-it against a real server: `REDIS_ADDR` if set, otherwise a disposable
-`valkey/valkey:8-alpine` container started with the `docker` CLI (image
-overridable with `RATELIMIT_TEST_IMAGE`) and removed afterwards; skipped when
-Docker is unavailable.
+An evicted or expired key returns as if never seen, which for every algorithm
+means a full allowance. The Redis store requires Redis 5 or later, or Valkey.
+The `ratelimit` package does not import a Redis client; only programs that
+import `ratelimit/goredis` link go-redis.
+
+### Limiter
+
+`New(name, algorithm, store, opts...)`. The name identifies the limiter in
+`Stats` and the `limiter` metric label. `WithMaxAttempts(n)`, default 8,
+bounds compare-and-set retries; it applies only to stores without `Updater`.
+Invalid arguments make `New` return an error wrapping `ErrInvalidOption`.
+
+### Middleware
+
+`Middleware(limiter, key, opts...)` returns a `func(http.Handler)
+http.Handler`. `key` is a `KeyFunc`:
+
+| Key function | Keys on |
+|---|---|
+| `KeyByHeader(name)` | a request header, such as `X-API-Key`; requests without it share the key `""` |
+| `KeyByRemoteAddr()` | the client IP without the port; behind a proxy, key on the forwarded header only if the proxy is trusted to set it |
+| `KeyGlobal()` | one key for every request |
+| your own `func(*http.Request) string` | for example the authenticated tenant from the request context |
+
+| Option | Effect |
+|---|---|
+| `WithLimitedHandler(h)` | Serves refused requests instead of the default plain-text 429. `Retry-After` and `X-RateLimit-Remaining` are set before it runs. |
+| `FailClosed()` | Answers 503 when the limiter returns an error. The default lets the request through, on the grounds that a limiter that cannot decide, which only a distributed store can cause, should not take the API down with it. |
+| `OnError(fn)` | Receives limiter errors, for logging. |
+| `WithoutRemainingHeader()` | Omits `X-RateLimit-Remaining`. |
+
+## Behaviour
+
+### Decisions
+
+`Allow(ctx, key)` returns a `Decision` and an error. When the error is nil:
+
+| Field | Allowed | Refused |
+|---|---|---|
+| `Allowed` | true | false |
+| `Remaining` | calls the key can still make now | 0 |
+| `RetryAfter` | 0 | time until a call for this key would be allowed, at least 1ms |
+
+Nothing waits: a refused call returns immediately. Callers that want to wait
+do so themselves, with their own deadline, using `RetryAfter`.
+
+### Errors
+
+A non-nil error means the limiter could not decide, which is distinct from a
+refusal: a store that is unreachable or replied unexpectedly, or
+`ErrContention` after the retry budget. `Stats.Errors` and the `error` result
+count them. The caller chooses the policy: `Admission` fails closed, the
+middleware fails open by default, and `FailOpen(limiter, onError)` wraps any
+`Allower` to allow on error.
+
+Through `Admission`, a refusal is a `*LimitedError` carrying the key and
+`RetryAfter`; `errors.Is(err, ratelimit.ErrLimited)` matches it.
+
+### What a refusal means to a caller
+
+A refused call did not run and has no side effects. Inbound, respond with
+`429 Too Many Requests` and `Retry-After` in whole seconds, rounded up, which
+is what the middleware does. Outbound, through the breaker, translate to your
+own "unavailable" error and respond with `503 Service Unavailable`; the
+limiter does not know which side it is on.
+
+### `Stats`
+
+`Stats` returns the name, algorithm, `Keys` (records in the store, when the
+store can report it), and the cumulative counters `Allowed`, `Limited`,
+`Errors` and `Conflicts`. `Stats.String` renders one line:
+
+```
+ratelimit: name=public-api algorithm=gcra keys=3 allowed=812 limited=41 errors=0 conflicts=2
+```
+
+### Lifecycle
+
+A `Limiter` has no goroutine and nothing to stop. Its metric series persist
+for the life of the process, as any package-level metric does. Drop a limiter
+when it is no longer needed.
+
+## Composing
+
+### With a circuit breaker
+
+`Admission(limiter, key)` returns a `func(context.Context) error` that refuses
+with a `*LimitedError`, which is the shape `breaker.WithAdmission` takes:
+
+```go
+b, err := breaker.New("db-fallback",
+    breaker.WithAdmission(ratelimit.Admission(limiter, "")),   // "" = one limit for the whole dependency
+)
+```
+
+The breaker runs the veto after the circuit has admitted the call. An open
+circuit still answers `breaker.ErrOpen`, a call the circuit refuses consumes
+no quota, and a call the limiter refuses is recorded by the breaker as
+denied, with no effect on the circuit's failure count, ramp or adaptive
+bulkhead. The packages do not import each other.
+
+### With your own store or algorithm
+
+Implement `Store` (`Get` and `CompareAndSet`, optionally `Updater` and
+`KeyCounter`) for another backend, and run `storetest.Run` from its tests to
+check the contract: absent keys, versioned updates, expiry and lost-update
+freedom under concurrent writers. Implement `Algorithm` (`Name`, `Validate`,
+`TTL`, `Step`) for another rule; it must be a pure function of the state and
+the time, and should return the state unchanged when it refuses.
 
 ## Observability
 
 ### Metrics
 
-Metrics, registered once at bootstrap alongside the breaker's and namespaced
-the same way:
-
-```go
-breaker.Register(prometheus.DefaultRegisterer)
-ratelimit.Register(prometheus.DefaultRegisterer)   // go_ratelimit_*
-```
+`ratelimit.Register(reg)` registers the package's metrics once, under
+`<namespace>_ratelimit_` with namespace `go` by default;
+`ratelimit.WithNamespace("inventory")` changes it. Every limiter reports
+under its name as the `limiter` label. Keys are not a label: per-tenant or
+per-address keys would be unbounded cardinality.
 
 | Metric | Type | Labels |
 |---|---|---|
@@ -114,34 +222,68 @@ ratelimit.Register(prometheus.DefaultRegisterer)   // go_ratelimit_*
 | `go_ratelimit_cas_conflicts_total` | counter | `limiter`, `algorithm` |
 | `go_ratelimit_keys` | gauge, when the store can report it | `limiter`, `algorithm` |
 
-Keys are deliberately not a label: per-tenant or per-IP keys would be
-unbounded cardinality. Aggregate per limiter, and use the breaker's
-`result="denied"` for the per-dependency view.
+Common queries:
+
+```promql
+rate(go_ratelimit_decisions_total{result="limited"}[5m])
+  / rate(go_ratelimit_decisions_total[5m])                    # share of calls refused
+rate(go_ratelimit_decisions_total{result="error"}[5m])        # decisions the limiter could not make
+rate(go_ratelimit_cas_conflicts_total[5m])                    # retries on a shared store; sustained means a hot key
+```
 
 ### Alerting
 
-The rules live in `contrib/prometheus/alerts.yaml`, in the `ratelimit` group,
-ready for `promtool check rules`.
+`contrib/prometheus/alerts.yaml` contains the rules below in a `ratelimit`
+group.
 
-| Rule | Severity | Fires when |
+| Rule | Severity | Condition |
 |---|---|---|
-| `RateLimitRefusingMajority` | ticket | more than half of decisions refused for 10m |
-| `RateLimitErrors` | page | a limiter could not decide: its store is unreachable, and the middleware fails open |
+| `RateLimitRefusingMajority` | ticket | refused decisions exceed half of all decisions for 10m |
+| `RateLimitErrors` | page | any `error` decisions for 2m |
 
-The first is a ticket: on an inbound limiter it means a client is being
-throttled hard, on an outbound one that you are over quota; either way
-someone should look at who and at whether the quota is right. The second is a
-page, because with the fail-open default in `Middleware` a limiter that cannot
-decide is the only signal that limits are not being enforced.
+The first indicates either a caller being throttled hard, on an inbound
+limiter, or your own service over its quota, on an outbound one; in both
+cases the quota or the caller needs attention rather than the limiter. The
+second is a page because, with the middleware's fail-open default, a limiter
+that cannot decide is enforcing nothing, and this is the only signal.
 
 ### Dashboard
 
-`contrib/grafana/keel.json`, the dashboard shared with the breaker, has a
-collapsed "Rate limiters" row filtered by the `Limiter` variable:
+`contrib/grafana/keel.json` includes a collapsed row for rate limiters, with
+the refused share, decision rates by result, errors and keys tracked. It is
+provided as a starting point.
 
-| Panel | Type | Shows |
-|---|---|---|
-| Decisions per second, by result | time series, stacked | Total height is demand; the limited band is what the quota turns away. |
-| Refused share | time series | Limited decisions over all decisions, per limiter. |
-| Limiter errors | time series | Decisions that could not be made. With the fail-open middleware this is the only sign limits are not enforced. |
-| Keys tracked | bar gauge | Records each memory store holds, bounded by `WithMaxKeys`. Not reported for Redis stores. |
+## Testing
+
+Algorithms are tested as pure functions with explicit times, covering each
+rule, its `RetryAfter`, the fixed window's boundary burst and the sliding
+window's absence of one. Stores run the contract in `ratelimit/storetest`:
+absent keys, versioned create and update, expiry, forward-moving time, and
+lost-update freedom under sixteen concurrent writers. The Redis store runs
+the contract and the algorithms against a real server: `REDIS_ADDR` if set,
+otherwise a disposable `valkey/valkey:8-alpine` container started with the
+`docker` CLI (`RATELIMIT_TEST_IMAGE` overrides the image) and removed
+afterwards; skipped when Docker is unavailable. The limiter's own tests
+cover the compare-and-set retry path under contention with a store that
+hides its `Updater`, error propagation, the middleware's headers and
+policies, and the breaker composition.
+
+## Benchmarks
+
+`go test -bench . -benchmem ./ratelimit/` on an Apple M5 Max (18 cores), Go
+1.27.1, memory store, one key unless stated:
+
+| Benchmark | ns/op | B/op | allocs/op |
+|---|---:|---:|---:|
+| `Allow`, GCRA, allowed | 43 | 0 | 0 |
+| `Allow`, fixed window, allowed | 43 | 0 | 0 |
+| `Allow`, sliding window, allowed | 43 | 0 | 0 |
+| `Allow`, refused | 40 | 0 | 0 |
+| `Allow`, 4096 rotating keys | 102 | 128 | 2 |
+| `Allow`, GCRA, 18 goroutines on one key | 235 | 0 | 0 |
+
+The three algorithms cost the same; the time is the map lookup and the mutex.
+The rotating-keys case allocates for new records as keys cycle past the
+eviction bound. The parallel figure is contention on the store's mutex for a
+single key. A Redis store adds two network round trips per decision, which
+dominates everything above.

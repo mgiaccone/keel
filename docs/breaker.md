@@ -1,372 +1,469 @@
-# breaker
+# Circuit Breaker
 
-The circuit breaker package: `github.com/mgiaccone/keel/breaker`.
+Package `github.com/mgiaccone/keel/breaker`. A circuit breaker for a single
+dependency, with a concurrency limit (bulkhead), a per-call timeout, a
+recovery ramp and a pluggable admission veto.
+
+## Quick start
 
 ```go
 b, err := breaker.New("db-fallback",
     breaker.WithIsFailure(func(err error) bool {
-        // "the backend answered, and the answer was no" is a success
+        // The database answering "no such row" is a successful call.
         return err != nil && !errors.Is(err, sql.ErrNoRows) && !errors.Is(err, context.Canceled)
     }),
-    breaker.WithOnStateChange(func(from, to breaker.State) {
-        slog.Warn("circuit state change", "dependency", "db-fallback", "from", from, "to", to)
-    }),
-    breaker.WithTimeout(2*time.Second),  // a hung call must become a failure, not a held probe slot
-    breaker.WithMaxInFlight(16),         // a slow backend must not absorb every goroutine
-    breaker.WithRecoveryRamp(2, 8),      // after a recovery, let traffic back in gradually
+    breaker.WithTimeout(2*time.Second),
+    breaker.WithMaxInFlight(16),
+    breaker.WithRecoveryRamp(2, 8),
 )
 if err != nil {
-    return err // wraps breaker.ErrInvalidOption; lists every bad option
+    return err // wraps breaker.ErrInvalidOption and lists every invalid option
 }
 
 row, err := b.Do(ctx, func(ctx context.Context) (Row, error) {
     return db.Get(ctx, key)
 })
-if errors.Is(err, breaker.ErrOpen) || errors.Is(err, breaker.ErrProbeLimit) || errors.Is(err, breaker.ErrBulkhead) {
-    // fail fast, do not retry
+switch {
+case errors.Is(err, breaker.ErrOpen), errors.Is(err, breaker.ErrProbeLimit), errors.Is(err, breaker.ErrBulkhead):
+    // The call did not run. Return an "unavailable" error; do not retry.
 }
 ```
 
-See `breaker/example_test.go` for a complete cache-then-database repository.
+`breaker/example_test.go` contains a complete repository that reads from a
+cache and falls back to a database through a breaker, with verified output.
 
-## When a breaker is the right tool
+## When to use it
 
-A breaker counts consecutive failures and, past a threshold, rejects every
-call outright until a probe succeeds. That is a blunt instrument, and it is
-the right one under two conditions:
+A breaker counts consecutive failures and, past a threshold, refuses every
+call until a probe succeeds. This suits a path where a few consecutive
+failures mean the dependency is down, which is true when call volume is low
+and errors are otherwise rare: a fallback taken only on a cache miss, a call
+made only on a slow path, a dependency with a small number of callers.
 
-- **The guarded path is low volume by construction.** The canonical case is a
-  fallback: a call made only on a cache miss, only when a primary is
-  unreachable, only for the long tail. At low request rates
-  consecutive-failure counting is well behaved; a handful of consecutive
-  failures really does mean the backend is down, and the circuit does not
-  flip-flop the way it would on a high-rps path where scattered errors are
-  normal.
-- **Legibility matters.** "Circuit open on db-fallback, next probe in
-  23s" is something an on-call engineer acts on immediately. `Stats.String`
-  is designed to be that line, and `OnStateChange` is the hook for logging
-  every transition.
+It does not suit a high-volume path where scattered errors are normal. There,
+a run of five failures is a coincidence rather than an outage, and the
+circuit would open on healthy traffic. Adaptive concurrency limits or
+error-rate windows are the tools for that case; this package does not
+implement them.
 
-Use **adaptive throttling** (client-side rate limiting keyed on the observed
-success ratio) instead when:
+The breaker's bulkhead addresses a different failure: a dependency that is
+slow but not failing. Slow calls never trip the circuit, but each one holds a
+goroutine, a connection and a request's memory. The bulkhead bounds how many
+calls can be in flight at once. The two limits are independent and both are
+usually wanted.
 
-- the path carries high volume, so an error-rate window has enough samples
-  to be meaningful and a binary open/closed switch would be either too
-  trigger-happy or too slow; or
-- the backend degrades partially rather than failing outright, and you want to
-  shed a *proportion* of load rather than all of it.
+Bounding how many calls *start* per second is rate limiting, which is the
+[`ratelimit`](ratelimit.md) package.
 
-The two compose: throttle the main read path, break the fallback path.
+## How it works
 
-## Knobs
+### States
 
-`New` takes the breaker's name first: the dependency it guards, which appears
-in `Stats`, the log line and the Prometheus `dependency` label. Every other
-setting is a functional option. A value that cannot be
-meant (a threshold below 1, a negative interval) makes `New` return an error
-wrapping `ErrInvalidOption` that names every offending option, so
-misconfiguration is caught at construction rather than at the first outage.
-
-| Option | Default | Meaning |
+| State | Calls are | Leaves when |
 |---|---|---|
-| `WithFailureThreshold(n)` | 5 | Consecutive failures while closed that trip the circuit. A success resets the run. |
-| `WithSuccessThreshold(n)` | 2 | Consecutive successful probes while half-open needed to close. See below. |
-| `WithMaxProbes(n)` | 1 | Concurrent probes admitted while half-open; the rest get `ErrProbeLimit`. |
-| `WithOpenInterval(base, max)` | 5s, 60s | Open interval after the first trip, and its cap. |
-| `WithTimeout(d)` | none | Deadline for each admitted call, derived from the caller's context. Set it: a hung call while half-open holds the probe slot forever. |
-| `WithMaxInFlight(n)` | unlimited | Bulkhead: calls at the cap get `ErrBulkhead` immediately, nothing queues. See below. |
-| `WithAdaptiveInFlight(min, max, target)` | off | Bulkhead whose cap moves by AIMD between the bounds. Opt-in; needs volume. See below. |
-| `WithRecoveryRamp(start, end)` | off | After a recovery, the cap starts at `start` and grows by one per success to `end`, then the steady limit resumes. See below. |
-| `WithAdmission(fn)` | none | A veto run on the caller's goroutine after the circuit admits a call; an error means fn does not run and the call is `denied`. The seam for rate limiters and anything else that may block to decide. |
-| `WithOpenJitter(f)` | 0.2 | ±fraction applied to each open interval. 0 disables. See below. |
-| `WithIsFailure(fn)` | `err != nil && !errors.Is(err, context.Canceled)` | Which errors count against the circuit. **Set this.** |
-| `WithOnStateChange(fn)` | none | Called synchronously on every transition. Log here. Must not call back into the breaker. |
-| `WithClock(now)` | `time.Now` | Clock; inject a fake in tests. |
-| `WithSeed(a, b)` | from runtime | Jitter RNG seed; fix it in tests. |
-| `WithObserver(o)` | none | Receives every event synchronously; how the Prometheus metrics are fed and the hook for other backends. |
+| closed | admitted; consecutive failures counted | `FailureThreshold` consecutive failures → open |
+| open | refused with `ErrOpen` | the open interval has elapsed → half-open |
+| half-open | admitted up to `MaxProbes` at a time; further calls refused with `ErrProbeLimit` | `SuccessThreshold` consecutive successes → closed; one failure → open |
 
-### `WithIsFailure` is the setting that matters
+A success while closed resets the failure count. A failure while half-open
+reopens the circuit regardless of how many successes preceded it.
 
-The default counts every error except a caller-side cancellation. That is
-wrong for almost every real backend, because it counts "the backend answered
-correctly and the answer was no": `sql.ErrNoRows`, an HTTP 404, a validation
-rejection. Those are successes as far as the circuit is concerned. Counting
-them as failures is the most common way to make a breaker trip on healthy
-traffic, and no other knob can compensate. Return `true` only for errors that
-mean the backend itself is unhealthy: timeouts, connection failures, 5xx.
+### The open interval
 
-A `context.Canceled` that `IsFailure` does not classify as a failure is
-*neutral*: it counts neither for nor against the circuit, since a caller
-giving up says nothing about the backend. `context.DeadlineExceeded` is a
-failure by default, deliberately: a backend too slow to answer is what the
-breaker exists to detect.
+The interval starts at `OpenBase` on the first trip and doubles on each
+consecutive trip (a trip from half-open that did not lead to a close), capped
+at `OpenMax`. It is then multiplied by a random factor in
+[1 − `OpenJitter`, 1 + `OpenJitter`]. The value is drawn once when the circuit
+opens and fixed for that open period. The consecutive-trip count resets when
+the circuit closes.
 
-### Why `WithSuccessThreshold` defaults to 2
+The transition from open to half-open is evaluated when the next call or
+`Stats` request arrives and the deadline has passed, not by a timer. A breaker
+with no traffic stays open indefinitely; there is nothing to recover for.
 
-With a threshold of 1, a single lucky probe against a still-sick backend
-restores full traffic. The traffic fails, the circuit reopens, the interval
-doubles, and the cycle repeats: the classic flap, each iteration hitting a
-recovering backend with a burst it cannot yet absorb. Requiring two
-consecutive successes is cheap insurance. A single failed probe reopens the
-circuit regardless of how many successes preceded it.
+### The state goroutine
 
-### Bulkhead: what it protects and how to size it
+All mutable state belongs to one goroutine started by `New`. A call to `Do`
+sends an admission request over an unbuffered channel and receives the
+decision on a per-call reply channel; after `fn` returns, it sends the outcome
+and waits for the goroutine to acknowledge that the outcome has been applied.
+`Stats` and `State` are answered by the same goroutine. There are no mutexes,
+atomics or timers in the package; the goroutine reads an injectable clock
+when a message arrives.
 
-The bulkhead protects your service, not the backend. A backend that is slow
-but not failing never trips the circuit, and every in-flight call holds a
-goroutine, a connection and whatever the request allocated. Without a cap
-those grow until requests that never needed the backend fail too. With one,
-the worst case is `maxInFlight` slots lost and everything else keeps working.
+The acknowledgement on settle gives `Do` its main guarantee: when `Do`
+returns, the outcome has been applied. A `Stats` call made afterwards reflects
+it, any transition it caused has already been reported, and the open deadline
+it may have started was computed against the clock as it read before `Do`
+returned.
 
-Size it from Little's law, in-flight = rate × latency, at the p99 and with
-headroom so it never bites in normal operation:
+### Generations
 
-```
-steady in-flight = misses/sec × p99 latency      e.g. 50/s × 40ms = 2
-cap              = 3–5 × steady                  e.g. 10
-```
+Every transition increments a generation counter, and every admitted call
+carries the generation it was admitted under. An outcome arriving with an old
+generation is counted in the totals but does not drive the state machine. A
+slow call admitted while closed that succeeds after the circuit has tripped
+does not close it; a stale probe does not free a probe slot.
 
-Keep the cap below the connection pool size, or the pile-up moves into the
-driver where you cannot see it. Worst-case exposure is `cap × WithTimeout` of
-backend time per instance. Ship without a cap first, watch
-`max_over_time(go_breaker_in_flight[7d])`, then set it at several times the
-peak.
+### Admission order
 
-The bulkhead is always on when configured. While half-open, `MaxProbes` is the
-tighter limit and applies first; while open nothing is admitted anyway. An
-open circuit reports `ErrOpen`, never `ErrBulkhead`, so the responder sees the
-more informative error.
+For each call, the checks run in this order, and the first that fails
+determines the error:
 
-`WithAdaptiveInFlight` moves the cap by additive increase, multiplicative
-decrease (AIMD), TCP's congestion rule: each success within `target` raises
-the cap by one, each failure or slow call halves it, cancellations leave it
-alone. It starts at `max` and only tightens on evidence. Its whole state is
-one integer, so the sawtooth on the `in_flight_limit` gauge explains every
-decision. It is opt-in because it needs volume: on a path doing a few calls a
-second, one slow query is indistinguishable from saturation and the cap will
-jitter. Prefer the static cap there.
+1. Circuit state: open → `ErrOpen`; half-open at `MaxProbes` → `ErrProbeLimit`.
+2. Bulkhead: at the in-flight cap → `ErrBulkhead`.
+3. Admission veto (`WithAdmission`), run on the caller's goroutine: its error
+   is returned as is, and the call is recorded as denied.
+4. Timeout (`WithTimeout`): the context passed to `fn` is derived from the
+   caller's with the configured deadline.
+5. `fn` runs.
+
+The order puts the most informative refusal first. A call the circuit refuses
+never reaches the veto, so it consumes no rate-limit quota; a call the veto
+refuses never runs.
+
+### Lifecycle
+
+`New` starts the goroutine. Nothing needs to be called to stop it: the
+goroutine holds only the breaker's internal state, never the value returned
+by `New`, and a runtime cleanup on that value stops the goroutine once the
+value is unreachable. A breaker created at startup runs for the life of the
+process; one created for a shorter purpose is dropped like any other value.
+`Stop` exists for deterministic teardown, for example in tests, or to remove
+the breaker's metric series immediately rather than after the next garbage
+collection. After `Stop`, `Do` returns `ErrStopped` and `Stats` the zero
+value.
+
+## Configuration
+
+`New` takes the breaker's name and functional options. The name identifies
+the dependency in `Stats`, the log line and the `dependency` metric label. An
+option given a value that cannot be meant makes `New` return an error
+wrapping `ErrInvalidOption` that lists every such option.
+
+| Option | Default | Effect |
+|---|---|---|
+| `WithFailureThreshold(n)` | 5 | Consecutive failures while closed that open the circuit. |
+| `WithSuccessThreshold(n)` | 2 | Consecutive successful probes while half-open that close it. |
+| `WithMaxProbes(n)` | 1 | Probes in flight at once while half-open. |
+| `WithOpenInterval(base, max)` | 5s, 60s | First open interval and its cap. |
+| `WithOpenJitter(f)` | 0.2 | Random factor applied to each open interval; 0 disables. |
+| `WithTimeout(d)` | none | Deadline for `fn`, derived from the caller's context. |
+| `WithMaxInFlight(n)` | unlimited | Bulkhead: calls in flight at once, in any state. |
+| `WithAdaptiveInFlight(min, max, target)` | off | Bulkhead whose cap moves between `min` and `max` by AIMD. Exclusive with `WithMaxInFlight`. |
+| `WithRecoveryRamp(start, end)` | off | After a close, the cap starts at `start` and grows by one per success until `end`. |
+| `WithAdmission(fn)` | none | Veto run after the circuit admits a call and before `fn`. |
+| `WithIsFailure(fn)` | see below | Which errors count as failures. |
+| `WithOnStateChange(fn)` | none | Called on every transition, on the state goroutine. |
+| `WithObserver(o)` | none | Receives every event; see Composing. |
+| `WithClock(fn)` | `time.Now` | Clock for open deadlines and call durations. |
+| `WithSeed(a, b)` | random | Seed for the jitter generator. |
+
+### `WithIsFailure`
+
+The default classifies every non-nil error as a failure except
+`context.Canceled`. It must be replaced for any real dependency, because the
+default counts errors that are correct answers: `sql.ErrNoRows`, an HTTP 404,
+a validation rejection. Those mean the dependency answered; counting them as
+failures opens the circuit on healthy traffic, and no other option
+compensates. The predicate should return true only for errors that indicate
+the dependency itself is unhealthy: timeouts, connection failures, 5xx
+responses.
+
+`context.DeadlineExceeded` is a failure by default. A dependency too slow to
+answer within its deadline is what the breaker exists to detect.
+
+An error for which the predicate returns false and which wraps
+`context.Canceled` is neutral: it is counted as canceled, neither extends nor
+resets the failure run, and frees a probe slot without counting as a probe
+result. A caller giving up says nothing about the dependency.
+
+### `WithSuccessThreshold`
+
+The default is 2. With 1, a single successful probe against a dependency that
+is still failing restores full traffic; the traffic fails, the circuit
+reopens with a doubled interval, and the sequence repeats. Requiring two
+consecutive successes prevents that oscillation at the cost of one extra
+probe per recovery.
+
+### Bulkhead
+
+`WithMaxInFlight(n)` refuses calls with `ErrBulkhead` when `n` are already in
+flight. Nothing queues. The refusal is not a failure and does not affect the
+circuit.
+
+The cap protects the caller's resources, not the dependency. Size it from the
+path's own numbers: in-flight ≈ rate × latency, taken at the p99, with a
+multiplier of three to five so the cap is not reached in normal operation.
+Keep it at or below the connection pool size, otherwise calls queue inside
+the driver instead. The worst case is `n` × `WithTimeout` of dependency time
+per instance. The `go_breaker_in_flight` gauge shows the actual peak; a
+reasonable procedure is to run without a cap, observe the peak over a week,
+and set the cap at several times that.
+
+`WithAdaptiveInFlight(min, max, target)` moves the cap instead of fixing it:
+each successful call that completes within `target` raises it by one, each
+failure or slower call halves it, cancellations leave it unchanged, and it
+stays within [`min`, `max`]. The cap starts at `max`. This is additive
+increase, multiplicative decrease, the rule TCP uses for congestion control;
+its state is one integer and its history is visible on the
+`go_breaker_in_flight_limit` gauge. It needs enough calls to distinguish a
+slow dependency from a single slow call. On a path with a few calls per
+second, one slow query halves the cap, so prefer the static cap there.
 
 ### Recovery ramp
 
-Closing the circuit after two probe successes proves the backend can handle
-one call at a time; it says nothing about the backlog that built up while the
-circuit was open. `WithRecoveryRamp(start, end)` releases that backlog
-gradually: on close the in-flight cap is `start`, each success raises it by
-one, and at `end` the steady limit resumes, the static cap or unlimited.
-Failures do not move it; enough of them reopen the circuit and the ramp
-restarts on the next close. Nothing happens at startup.
+When the circuit closes, every caller that was refused during the open period
+may retry at once, against a dependency that has just handled one probe at a
+time. `WithRecoveryRamp(start, end)` sets the in-flight cap to `start` on
+close and raises it by one per successful call until it reaches `end`, after
+which the steady cap applies (`WithMaxInFlight`, or unlimited). Failures do
+not move the ramp; enough of them reopen the circuit, and the ramp restarts
+on the next close. Nothing happens at startup.
 
-Under `WithAdaptiveInFlight` the ramp only seeds the cap; AIMD grows it from
-there, and the ramp is over when the cap reaches `end` or AIMD lowers it,
-which means backoff rather than recovery.
+Under `WithAdaptiveInFlight`, the ramp only sets the cap at close; AIMD grows
+it from there, and the ramp is over when the cap reaches `end` or AIMD lowers
+it.
 
-`Stats.Ramping`, the `(ramping)` suffix on the log line and the
-`go_breaker_ramping` gauge say a ramp is in progress. That matters because a
-cap of 3 during a ramp is recovery working as designed, and the same cap
-under AIMD is the backend struggling; the saturation alert in [Observability](#observability) excludes
-ramps for exactly this reason.
+`Stats.Ramping` and the `go_breaker_ramping` gauge report a ramp in progress.
+A low cap during a ramp is the intended recovery; the same cap under AIMD
+means the dependency is slow. The bulkhead alert excludes ramps for this
+reason.
 
-Tell consumers one thing about `ErrBulkhead`, and about `ErrOpen`: the request
-never ran, so there are no side effects to reconcile. Return it as
-`503 Service Unavailable` with a `Retry-After`, never as a 4xx, and ask them to
-fail fast rather than retry immediately.
+### `WithOpenJitter`
 
-### Why jitter, and why it matters more here
+Every instance of a service trips on the same outage within moments of each
+other. Without jitter they finish the same open interval together and probe
+together; the recovering dependency receives a synchronised burst, fails, and
+every instance reopens for twice the interval. The default of 0.2 spreads the
+probes over ±20% of the interval.
 
-The open interval doubles per consecutive trip from `OpenBase`, capped at
-`OpenMax`, so a backend that stays down is probed less and less often.
-`ConsecutiveTrips` resets when the circuit closes.
+### `WithTimeout`
 
-Every instance of the service trips on the same backend outage within moments
-of each other. Without jitter they all finish the same open interval together
-and probe in lockstep. The recovering backend takes a synchronised burst, fails
-under it, and every instance reopens together, for twice as long. Jitter of
-±20% spreads the instances' probes over a window of seconds, so recovery is
-gradual. The jittered deadline is drawn once on entering Open and fixed for
-that open period; `Stats.NextProbeIn` counts down to it.
+The breaker assumes every admitted call eventually settles. A call that hangs
+while the circuit is half-open holds the only probe slot and nothing can
+free it. `WithTimeout` derives the context passed to `fn` from the caller's
+with an added deadline, so a hung dependency becomes
+`context.DeadlineExceeded`, which is a failure, and the circuit trips. The
+timeout starts when the call is admitted. `fn` must honour its context; the
+breaker cannot abort `fn`, and `Do` returns only when `fn` does.
 
-## Guarantees
+## Behaviour
 
-- When `Do` returns, the outcome has been applied. A subsequent `Stats`
-  reflects it and any transition it caused has already been reported through
-  `OnStateChange`. There is no barrier to call.
-- `Admitted + Rejected + Shed + Denied + InFlight == Calls` and
-  `Successes + Failures + Canceled == Admitted` hold at every observation, and
-  every cumulative counter is monotonic.
-- A stale outcome, from a call admitted before the most recent transition, is
-  counted in the totals but never drives the state machine. A slow success
-  from before a trip cannot close a circuit that has since opened.
-- Open → half-open is evaluated lazily when a call or `Stats` arrives. With no
-  traffic there is nothing to recover for, and no goroutine is woken.
-- Nothing to stop or close. The state goroutine lives while the breaker is
-  reachable and stops itself once it is not, like a `time.Timer`; a breaker
-  created at bootstrap simply lives for the process. `Stop` exists for
-  deterministic teardown and is optional.
+### Errors from `Do`
+
+| Error | Meaning | `fn` ran |
+|---|---|---|
+| `ErrOpen` | circuit open | no |
+| `ErrProbeLimit` | half-open, `MaxProbes` probes in flight | no |
+| `ErrBulkhead` | in-flight cap reached | no |
+| the veto's error | `WithAdmission` refused | no |
+| `ctx.Err()` | caller's context done before admission | no |
+| `ErrStopped` | after `Stop` | no |
+| `fn`'s error | returned unchanged | yes |
+
+The breaker never rewrites `fn`'s error. Every other error means the call did
+not run and has no side effects. Callers should translate the three refusals
+into their own "unavailable" error at the boundary, return it to their
+clients as `503 Service Unavailable` with a `Retry-After` (for `ErrOpen`,
+`Stats.NextProbeIn`), and not retry: a retry is refused again or takes the
+probe slot recovery depends on.
+
+### Results
+
+Every call that reaches the breaker ends in exactly one result:
+
+| Result | `fn` ran | Effect on the circuit |
+|---|---|---|
+| success | yes | resets the failure run; counts toward closing while half-open |
+| failure | yes | extends the failure run; reopens while half-open |
+| canceled | yes | none |
+| rejected | no | none (`ErrOpen`, `ErrProbeLimit`) |
+| shed | no | none (`ErrBulkhead`) |
+| denied | no | none (admission veto) |
+
+### `Stats`
+
+`Stats` returns a snapshot with the state, `ConsecutiveTrips`, `NextProbeIn`
+(zero unless open), `InFlight`, `InFlightLimit` (0 when unlimited),
+`Ramping`, and the cumulative counters `Calls`, `Rejected`, `Shed`, `Denied`,
+`Admitted`, `Successes`, `Failures`, `Canceled` and `Trips`. Two identities
+hold at every observation:
+
+```
+Admitted + Rejected + Shed + Denied + InFlight == Calls
+Successes + Failures + Canceled == Admitted
+```
+
+`Admitted` counts calls whose `fn` has returned; a running call is in
+`InFlight`. Every cumulative counter is monotonic.
+
+`Stats.String` renders one line:
+
+```
+breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 denied=0 ok=760 fail=9 canceled=0 in_flight=3/64 next_probe_in=23s
+```
+
+The cap after the slash appears only when one is set, `(ramping)` follows it
+during a ramp, and `next_probe_in` appears only while open.
+
+### Guarantees
+
+- When `Do` returns, the outcome has been applied.
+- A stale outcome is counted but never drives the state machine.
+- Open → half-open is evaluated lazily; no goroutine wakes for an idle breaker.
+- `Do` allocates nothing on the admitted or refused paths (a per-call channel
+  is recycled through a free list). `WithTimeout` adds the allocations of
+  `context.WithTimeout`.
+- A panic in `fn` is recorded as a failure, frees the call's slots, and
+  propagates.
+
+## Composing
+
+### With a rate limiter
+
+`WithAdmission` takes a `func(context.Context) error`. `ratelimit.Admission`
+returns one, so a limiter is attached with:
+
+```go
+b, err := breaker.New("db-fallback",
+    breaker.WithAdmission(ratelimit.Admission(limiter, "")),
+)
+```
+
+The veto runs after the circuit has admitted the call, so a call the circuit
+refuses consumes no quota, and a call the limiter refuses is recorded by the
+breaker as denied. The two packages do not import each other.
+
+### With other telemetry
+
+`WithObserver` attaches an `Observer` that receives `Started`, `Call(Result)`,
+`Transition(from, to, consecutiveTrips, openUntil)`, `Load(inFlight, limit,
+ramping)` and `Stopped`, in order, on the state goroutine. The Prometheus
+metrics are one implementation of this interface. Observers must return
+promptly and must not call back into the breaker.
 
 ## Observability
 
 ### Metrics
 
-The package owns one set of metric vectors. Every breaker feeds them from its
-state goroutine under its name; `Register` publishes them
-under `<namespace>_breaker_`, with namespace `go` by default.
-Register once at bootstrap, then create as many breakers as you like:
-
-```go
-if err := breaker.Register(prometheus.DefaultRegisterer); err != nil { ... }
-// or, so each service's breakers carry its own name:
-if err := breaker.Register(prometheus.DefaultRegisterer, breaker.WithNamespace("inventory")); err != nil { ... }
-
-db, err  := breaker.New("db-fallback", ...)
-sms, err := breaker.New("sms-gateway", ...)
-```
+`breaker.Register(reg)` registers the package's metrics once, under
+`<namespace>_breaker_` with namespace `go` by default;
+`breaker.WithNamespace("inventory")` changes it. Every breaker reports under
+its name as the `dependency` label. A breaker's series exist from the moment
+`New` returns and are removed when it is stopped or collected.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `go_breaker_state` | gauge, one-hot | `dependency`, `state` |
-| `go_breaker_open_until_timestamp_seconds` | gauge, unix time, 0 unless open | `dependency` |
+| `go_breaker_state` | gauge, one-hot | `dependency`, `state` ∈ closed, open, half-open |
+| `go_breaker_open_until_timestamp_seconds` | gauge, Unix time, 0 unless open | `dependency` |
 | `go_breaker_consecutive_trips` | gauge | `dependency` |
 | `go_breaker_in_flight` | gauge | `dependency` |
 | `go_breaker_in_flight_limit` | gauge, +Inf when unlimited | `dependency` |
-| `go_breaker_ramping` | gauge, 1 during a recovery ramp | `dependency` |
+| `go_breaker_ramping` | gauge, 0 or 1 | `dependency` |
 | `go_breaker_calls_total` | counter | `dependency`, `result` ∈ success, failure, canceled, rejected, shed, denied |
 | `go_breaker_trips_total` | counter | `dependency` |
 
-The names below assume the default namespace; with `WithNamespace` the
-`go_` prefix changes accordingly, and so must the alert rules and dashboard
-further down. A breaker's series exist at zero from the moment `New` returns
-and are deleted when it is stopped. Counters are incremented by the same goroutine
-that updates `Stats`, so the two always agree. Because open → half-open is
-evaluated lazily, an idle breaker keeps reporting `state="open"` past its
-deadline; `go_breaker_open_until_timestamp_seconds - time()` going negative is
-how you see that. `go_breaker_state{state="open"} == 1` is the alert and
-`increase(go_breaker_trips_total[10m])` catches flapping.
+The state gauge is one-hot: exactly one of the three `state` series is 1. This
+allows `sum by (state)` across a fleet and reads as text in queries.
 
-Custom instrumentation, such as OpenTelemetry, attaches through the same
-`Observer` interface the metrics use, via `WithObserver`.
+Because open → half-open is evaluated lazily, an idle breaker reports
+`state="open"` past its deadline. `go_breaker_open_until_timestamp_seconds -
+time()` is the time until the next probe would be admitted; a negative value
+means the deadline has passed and the next call will move the circuit to
+half-open.
+
+Common queries:
+
+```promql
+go_breaker_state{state="open"} == 1                         # open now
+rate(go_breaker_calls_total{result=~"rejected|shed"}[5m])   # calls refused per second
+go_breaker_in_flight / go_breaker_in_flight_limit           # bulkhead utilisation
+increase(go_breaker_trips_total[10m])                       # trips in the last ten minutes
+```
 
 ### Alerting
 
-Alert on what the on-call engineer can act on, and aggregate across instances
-so a single flapping pod does not page. Every alert carries the `dependency`
-label, so Alertmanager can route each dependency to the team that owns it.
+`contrib/prometheus/alerts.yaml` contains the rules below in a `breaker`
+group, for `promtool check rules`. They aggregate across instances so that
+one instance's state does not page on its own, and every alert carries the
+`dependency` label for routing.
 
-The rules live in `contrib/prometheus/alerts.yaml`, ready for
-`promtool check rules` and for dropping into your rule files. In outline:
-
-| Rule | Severity | Fires when |
+| Rule | Severity | Condition |
 |---|---|---|
-| `breaker:open_fraction` (recording) | | share of instances whose circuit is open, per dependency |
-| `BreakerOpenFleetWide` | page | more than half the instances are open for 2m: the dependency is down |
-| `BreakerFlapping` | ticket | more than 5 trips in 30m: half-recovering backend, or `IsFailure` counting healthy answers |
-| `BreakerSheddingMajority` | page | more than half of calls refused, by circuit or bulkhead, for 5m |
-| `BreakerBulkheadSaturated` | ticket | bulkhead at its cap for 5m outside a recovery ramp: the backend is slow, not down |
-| `BreakerMetricsAbsent` | ticket | no series for an expected dependency: a forgotten `Register` or a breaker never created |
+| `breaker:open_fraction` (recording) | | instances open ÷ instances, per dependency |
+| `BreakerOpenFleetWide` | page | `breaker:open_fraction > 0.5` for 2m |
+| `BreakerFlapping` | ticket | more than 5 trips in 30m |
+| `BreakerSheddingMajority` | page | refused calls exceed half of all calls for 5m |
+| `BreakerBulkheadSaturated` | ticket | in-flight at the cap for 5m, outside a recovery ramp |
+| `BreakerMetricsAbsent` | ticket | no series for an expected dependency for 10m |
 
+`BreakerOpenFleetWide` uses `for: 2m` because the first open interval is 5s
+by default and a single trip that recovers on its first probe should not
+page. `BreakerFlapping` indicates either a dependency that is partially
+recovering or an `IsFailure` predicate that counts correct answers as
+failures. `BreakerMetricsAbsent` catches a missing `Register` call or a
+breaker that was never created, both of which otherwise look like a healthy
+dependency.
 
-What not to alert on:
+`go_breaker_consecutive_trips` and `go_breaker_open_until_timestamp_seconds`
+are for dashboards rather than alerts; a negative countdown is the lazy
+transition, not a fault.
 
-- **`go_breaker_consecutive_trips`** is for the dashboard. `max by (dependency)`
-  of it shows how deep into backoff the fleet is.
-- **`go_breaker_open_until_timestamp_seconds`** is for the dashboard too.
-  `… - time()` is the countdown to the next probe. Negative means the
-  breaker is idle with its deadline passed, waiting for the next call to go
-  half-open. That is lazy expiry working as designed, not a fault.
+A CPU-throttled container hits its own timeouts, and `DeadlineExceeded` is a
+failure, so the circuit opens because of the container rather than the
+dependency. Plotting `container_cpu_cfs_throttled_periods_total` next to
+`breaker:open_fraction` distinguishes the two.
 
-Put the container's CPU throttling counter
-(`container_cpu_cfs_throttled_periods_total`) on the same dashboard as
-`breaker:open_fraction`. A pod starved of CPU hits its own timeouts, and
-`DeadlineExceeded` is a failure by default, so the circuit trips because of
-the pod rather than the dependency. Seeing both side by side makes the false
-attribution obvious.
-
-Runbook for `BreakerOpenFleetWide`: check the dependency's own health first,
-then read one instance's `Stats` line from its health endpoint. It says
-`name=db-fallback state=open trips=3(consecutive=3) … next_probe_in=18s`,
-which gives how long it has been failing and when the next probe happens
-without another graph.
+When `BreakerOpenFleetWide` fires: check the dependency's own health, then
+read one instance's `Stats` line from its health endpoint, which gives the
+current state, how many times it has tripped, and when the next probe is due.
 
 ### Dashboard
 
-`contrib/grafana/keel.json` is an importable Grafana dashboard
-(Grafana 10+, Prometheus datasource). Import it via Dashboards → New → Import,
-pick your Prometheus datasource when prompted, and select dependencies with
-the `Dependency` variable.
-
-
-| Panel | Type | Shows |
-|---|---|---|
-| Open now | bar gauge | The same fraction, current value. |
-| Load shed | time series | Rejected and shed calls as a share of all calls: the user-facing symptom. |
-| In flight vs limit | time series | Bulkhead headroom per dependency; a line pinned to the limit is a slow backend, unless the limit is climbing after a recovery, which is the ramp. |
-| Trips | bars | Trips per interval, stacked by dependency. A comb is flapping. |
-| Open circuits | table | One row per open breaker with the countdown to the next probe and its consecutive trips. A negative countdown means idle past the deadline, waiting for a call. |
-| Per instance (collapsed) | state timeline | One row per breaker, Closed / Half-open / Open, for drill-down. |
-
-| Rate limiters (collapsed row) | time series, bar gauge | Decisions per second by result per limiter, the refused share, limiter errors, and per-key records kept. Filtered by the `Limiter` variable. |
-
-The per-instance panel collapses the one-hot `go_breaker_state` gauge into a
-single ordinal, which is the shape a state timeline wants:
-
-```promql
-go_breaker_state{state="half-open"} * 1 + go_breaker_state{state="open"} * 2
-```
-
-with value mappings `0 → Closed`, `1 → Half-open`, `2 → Open`. Two things
-not to do: plotting the raw `go_breaker_state` series on a time-series panel
-gives three overlapping 0/1 lines per breaker, and plotting
-`go_breaker_open_until_timestamp_seconds` directly plots a Unix timestamp; it
-is only useful as the derived countdown `… - time()`.
-
-The same dashboard carries a collapsed row for rate limiters; see the
-`ratelimit` document.
+`contrib/grafana/keel.json` is an importable Grafana dashboard covering these
+metrics, provided as a starting point. The state gauge is best shown as a
+state timeline after collapsing the one-hot series into one ordinal:
+`go_breaker_state{state="half-open"} * 1 + go_breaker_state{state="open"} * 2`.
 
 ## Testing
 
-The suite has three layers beyond the per-property tests. Every blocking wait
-in it carries a deadline, so a deadlock fails at a named line rather than
-hanging until the `go test` timeout; `-short` trims the model and chaos
-iterations.
+Beyond one test per documented property, the suite has three layers:
 
 - **A reference model.** `TestModel` drives the breaker and an independent
-  single-threaded model of the documented rules through the same random
-  sequences of admissions, out-of-order settles and clock advances, and
-  compares `Stats` after every step. A divergence prints the seed.
-- **Chaos with invariants.** `TestChaosInvariants` hammers one breaker from
-  many goroutines with random outcomes, cancellations, clock advances and
-  inspections, checks the accounting invariants at every observation, and
-  verifies afterwards that every transition the hook saw was a legal edge.
+  single-threaded implementation of the documented rules through the same
+  random sequences of admissions, out-of-order settles, admission vetoes and
+  clock advances, comparing `Stats` after every step. A divergence prints the
+  seed.
+- **Chaos with invariants.** `TestChaosInvariants` runs many goroutines with
+  random outcomes, cancellations, vetoes, clock advances and inspections,
+  checks the `Stats` identities and counter monotonicity at every observation,
+  and afterwards checks that every transition the hook saw was a legal edge.
 - **Regression pins.** The settle-before-apply clock race, zero allocations
-  per call, probe-slot release on panic, goroutine release on `Stop`, and
-  free-list overflow each have a dedicated test.
+  per call, probe-slot release on panic, goroutine exit for a dropped breaker,
+  and free-list overflow each have a dedicated test.
+
+Every blocking wait in the suite has a deadline, so a deadlock fails at a
+named line. `-short` reduces the model and chaos iterations. The tests use an
+injected clock and a fixed jitter seed; the only synchronisation primitive in
+the test code is the fake clock's atomic.
 
 ## Benchmarks
 
-Apple M5 Max, 18 cores, Go 1.27.1, `go test -bench . -benchmem`:
+`go test -bench . -benchmem ./breaker/` on an Apple M5 Max (18 cores), Go
+1.27.1:
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| Baseline (no breaker) | 1.6 | 0 | 0 |
-| `Do` closed, serial (Prometheus metrics fed) | 1007 | 0 | 0 |
-| `Do` closed, serial, `WithTimeout` set | 1252 | 272 | 4 |
-| `Do` open (rejection) | 453 | 0 | 0 |
-| `Do` closed, `RunParallel` (18 goroutines) | 3530 | 0 | 0 |
-| `Stats` | 528 | 240 | 2 |
+| baseline, `fn` called directly | 1.6 | 0 | 0 |
+| `Do`, closed, serial, metrics fed | 1004 | 0 | 0 |
+| `Do`, closed, serial, `WithTimeout` set | 1287 | 272 | 4 |
+| `Do`, open (refused) | 446 | 0 | 0 |
+| `Do`, closed, 18 goroutines | 3608 | 0 | 0 |
+| `Stats` | 550 | 256 | 2 |
 
-Each call talks to the loop on one pointer-free `chan uint64`: the loop
-replies on it with the admission decision and later acknowledges the settle on
-it. Tokens are recycled through a buffered channel used as a free list, so in
-steady state `Do` allocates nothing. `Stats` allocates its reply channel, two objects now that the snapshot carries
-a name; it is a scrape path, not a request path. `WithTimeout` costs the standard
-`context.WithTimeout` allocations per call, which is the price of a bounded
-network call anywhere in Go.
-
-The parallel figure is per call across all goroutines: a single actor
-serialises every admission and settle, so contention shows up as latency, not
-as a data race. That is acceptable on a path that is low volume by
-construction and would not be for a hot read path.
-
-Channel handoff cost is dominated by scheduler wakeups and is substantially
-worse on a single core; expect roughly double the latency on a 1-vCPU box.
-Rejection is cheaper than admission because it makes one channel round trip
-instead of two.
+A `Do` on the admitted path costs two channel round trips, one for admission
+and one for the acknowledged settle; the refused path costs one. Channel
+handoff time is dominated by scheduler wakeups and is roughly double on a
+single core. The parallel figure is per call across all goroutines: a single
+state goroutine serialises every admission, so contention appears as latency.

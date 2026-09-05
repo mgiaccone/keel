@@ -75,7 +75,7 @@ func New(name string, algorithm Algorithm, store Store, opts ...Option) (*Limite
 // Allow implements [Allower].
 func (l *Limiter) Allow(ctx context.Context, key string) (Decision, error) {
 	if u, ok := l.store.(Updater); ok {
-		d, err := u.Update(ctx, key, l.algorithm.TTL(), l.algorithm.Step)
+		d, err := u.Update(ctx, key, l.algorithm)
 		if err != nil {
 			return l.fail(fmt.Errorf("ratelimit: store update: %w", err))
 		}

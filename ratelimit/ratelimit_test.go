@@ -575,3 +575,87 @@ func TestMetrics(t *testing.T) {
 		t.Fatalf("bad namespace: %v", err)
 	}
 }
+
+var _benchSink Decision
+
+func benchLimiter(b *testing.B, algo Algorithm) *Limiter {
+	b.Helper()
+	store, err := NewMemoryStore()
+	if err != nil {
+		b.Fatal(err)
+	}
+	l, err := New("bench", algo, store)
+	if err != nil {
+		b.Fatal(err)
+	}
+	return l
+}
+
+// The allowed path with a memory store, per algorithm. Rates are high enough
+// that the bucket never empties, so every call takes the write path.
+func BenchmarkAllowGCRA(b *testing.B) {
+	b.ReportAllocs()
+	l := benchLimiter(b, GCRA(1e9, 1<<30))
+	ctx := context.Background()
+	for b.Loop() {
+		_benchSink, _ = l.Allow(ctx, "k")
+	}
+}
+
+func BenchmarkAllowFixedWindow(b *testing.B) {
+	b.ReportAllocs()
+	l := benchLimiter(b, FixedWindow(1<<30, time.Hour))
+	ctx := context.Background()
+	for b.Loop() {
+		_benchSink, _ = l.Allow(ctx, "k")
+	}
+}
+
+func BenchmarkAllowSlidingWindow(b *testing.B) {
+	b.ReportAllocs()
+	l := benchLimiter(b, SlidingWindow(1<<30, time.Hour))
+	ctx := context.Background()
+	for b.Loop() {
+		_benchSink, _ = l.Allow(ctx, "k")
+	}
+}
+
+// The refused path: an exhausted key, so Step leaves the state unchanged and
+// nothing is written.
+func BenchmarkAllowRefused(b *testing.B) {
+	b.ReportAllocs()
+	l := benchLimiter(b, GCRA(1e-9, 1))
+	ctx := context.Background()
+	l.Allow(ctx, "k")
+	for b.Loop() {
+		_benchSink, _ = l.Allow(ctx, "k")
+	}
+}
+
+// Distinct keys on every call: the map and LRU cost, with eviction once the
+// key bound is passed.
+func BenchmarkAllowManyKeys(b *testing.B) {
+	b.ReportAllocs()
+	l := benchLimiter(b, GCRA(1e9, 1<<30))
+	ctx := context.Background()
+	keys := make([]string, 4096)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("tenant-%d", i)
+	}
+	i := 0
+	for b.Loop() {
+		_benchSink, _ = l.Allow(ctx, keys[i&4095])
+		i++
+	}
+}
+
+func BenchmarkAllowParallel(b *testing.B) {
+	b.ReportAllocs()
+	l := benchLimiter(b, GCRA(1e9, 1<<30))
+	ctx := context.Background()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			l.Allow(ctx, "k")
+		}
+	})
+}
