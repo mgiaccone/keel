@@ -13,7 +13,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 
-	"breaker"
+	"github.com/mgiaccone/keel/breaker"
 )
 
 // Domain errors returned by the Repository. Callers see these, never the
@@ -142,8 +142,6 @@ func (r *Repository) Health() breaker.Stats { return r.fallback.Stats() }
 // Close releases the breaker's goroutine.
 func (r *Repository) Close() { r.fallback.Stop() }
 
-// --- fakes ---------------------------------------------------------------
-
 type fakeCache map[string]Record
 
 func (c fakeCache) Get(_ context.Context, key string) (Record, bool, error) {
@@ -247,12 +245,12 @@ func Example() {
 	// level=WARN msg="circuit state change" dependency=db-fallback from=closed to=open
 	// d -> repo: database: dial tcp: i/o timeout
 	// e -> repo: temporarily unavailable: breaker: circuit open
-	// breaker: name=db-fallback state=open trips=1(consecutive=1) calls=6 rejected=1 shed=0 ok=2 fail=3 canceled=0 in_flight=0/16 next_probe_in=4.693s
+	// breaker: name=db-fallback state=open trips=1(consecutive=1) calls=6 rejected=1 shed=0 denied=0 ok=2 fail=3 canceled=0 in_flight=0/16 next_probe_in=4.693s
 	// level=WARN msg="circuit state change" dependency=db-fallback from=open to=half-open
 	// b -> from-db
 	// level=WARN msg="circuit state change" dependency=db-fallback from=half-open to=closed
 	// b -> from-db
-	// breaker: name=db-fallback state=closed trips=1(consecutive=0) calls=8 rejected=1 shed=0 ok=4 fail=3 canceled=0 in_flight=0/2(ramping)
+	// breaker: name=db-fallback state=closed trips=1(consecutive=0) calls=8 rejected=1 shed=0 denied=0 ok=4 fail=3 canceled=0 in_flight=0/2(ramping)
 }
 
 func ExampleRegister() {
@@ -293,9 +291,10 @@ func ExampleRegister() {
 		}
 	}
 	// Output:
-	// # HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected and shed did not.
+	// # HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.
 	// # TYPE go_breaker_calls_total counter
 	// go_breaker_calls_total{dependency="db-fallback",result="canceled"} 0
+	// go_breaker_calls_total{dependency="db-fallback",result="denied"} 0
 	// go_breaker_calls_total{dependency="db-fallback",result="failure"} 2
 	// go_breaker_calls_total{dependency="db-fallback",result="rejected"} 1
 	// go_breaker_calls_total{dependency="db-fallback",result="shed"} 0

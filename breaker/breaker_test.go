@@ -484,8 +484,8 @@ func TestConcurrentAccounting(t *testing.T) {
 	if s.Calls != goroutines*perGoroutine {
 		t.Fatalf("Calls = %d, want %d", s.Calls, goroutines*perGoroutine)
 	}
-	if s.Admitted+s.Rejected+s.Shed != s.Calls {
-		t.Fatalf("Admitted(%d) + Rejected(%d) + Shed(%d) != Calls(%d)", s.Admitted, s.Rejected, s.Shed, s.Calls)
+	if s.Admitted+s.Rejected+s.Shed+s.Denied != s.Calls {
+		t.Fatalf("Admitted(%d) + Rejected(%d) + Shed(%d) + Denied(%d) != Calls(%d)", s.Admitted, s.Rejected, s.Shed, s.Denied, s.Calls)
 	}
 	if s.Successes+s.Failures+s.Canceled != s.Admitted {
 		t.Fatalf("Successes(%d) + Failures(%d) + Canceled(%d) != Admitted(%d)", s.Successes, s.Failures, s.Canceled, s.Admitted)
@@ -692,9 +692,9 @@ func TestTokenPoolSaturation(t *testing.T) {
 			})
 		})
 	}
-	// Wait until every call has been admitted, then let them all settle.
+	// Wait until every call is in flight, then let them all settle.
 	deadline := time.Now().Add(10 * time.Second)
-	for h.Stats().Admitted < uint64(2*_tokenPoolSize) {
+	for h.Stats().InFlight < 2*_tokenPoolSize {
 		if time.Now().After(deadline) {
 			t.Fatal("calls were not all admitted in time")
 		}
@@ -893,7 +893,7 @@ func TestBulkheadShedsAtCap(t *testing.T) {
 		t.Fatalf("third call: err = %v, want ErrBulkhead", err)
 	}
 	s := h.Stats()
-	if s.InFlight != 2 || s.InFlightLimit != 2 || s.Shed != 1 || s.Rejected != 0 || s.Calls != 3 {
+	if s.InFlight != 2 || s.InFlightLimit != 2 || s.Shed != 1 || s.Rejected != 0 || s.Calls != 3 || s.Admitted != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
 	if !strings.Contains(s.String(), "shed=1") || !strings.Contains(s.String(), "in_flight=2/2") {
@@ -1157,7 +1157,82 @@ func TestRecoveryRampInvalid(t *testing.T) {
 	}
 }
 
-// --- regression ---------------------------------------------------------
+// denyKey marks a context whose call the test admission hook must veto.
+type denyKey struct{}
+
+var errDenied = errors.New("denied by test hook")
+
+func denyIfMarked(ctx context.Context) error {
+	if ctx.Value(denyKey{}) != nil {
+		return errDenied
+	}
+	return nil
+}
+
+func TestAdmissionDeniedIsNeutralAndUnadmitted(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(2), WithMaxInFlight(1), WithAdmission(denyIfMarked))
+	h.fail(t) // one failure on the run
+	ran := false
+	_, err := h.Do(context.WithValue(t.Context(), denyKey{}, true), func(context.Context) (int, error) {
+		ran = true
+		return 1, nil
+	})
+	if !errors.Is(err, errDenied) || ran {
+		t.Fatalf("err = %v, ran = %t", err, ran)
+	}
+	s := h.Stats()
+	if s.Denied != 1 || s.Admitted != 1 || s.Calls != 2 || s.Failures != 1 || s.InFlight != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	if s.Admitted+s.Rejected+s.Shed+s.Denied != s.Calls {
+		t.Fatalf("invariant broken: %+v", s)
+	}
+	if !strings.Contains(s.String(), "denied=1") {
+		t.Fatalf("line = %q", s.String())
+	}
+	h.fail(t) // the denial did not reset the failure run: this is the second
+	h.wantState(t, Open)
+}
+
+func TestAdmissionRunsAfterCircuitAndBulkhead(t *testing.T) {
+	calls := 0
+	h := newHarness(t, WithFailureThreshold(1), WithAdmission(func(context.Context) error { calls++; return nil }))
+	h.trip(t)
+	if err := h.ok(t); !errors.Is(err, ErrOpen) {
+		t.Fatalf("err = %v", err)
+	}
+	h.Stop() // orders the read of calls after the loop
+	if calls != 1 {
+		t.Fatalf("hook ran %d times; the rejected call must not reach it", calls)
+	}
+}
+
+func TestAdmissionDeniedProbeFreesSlot(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(1), WithAdmission(denyIfMarked))
+	h.trip(t)
+	h.clock.Add(time.Second)
+	if _, err := h.Do(context.WithValue(t.Context(), denyKey{}, true), func(context.Context) (int, error) { return 1, nil }); !errors.Is(err, errDenied) {
+		t.Fatalf("err = %v", err)
+	}
+	h.wantState(t, HalfOpen) // a denial is not a probe result
+	if err := h.ok(t); err != nil {
+		t.Fatalf("probe slot leaked: %v", err)
+	}
+}
+
+func TestAdmissionDoesNotMoveRampOrAIMD(t *testing.T) {
+	h := newHarness(t, WithAdaptiveInFlight(1, 8, 100*time.Millisecond), WithAdmission(denyIfMarked))
+	h.Do(context.WithValue(t.Context(), denyKey{}, true), func(context.Context) (int, error) { return 1, nil })
+	if s := h.Stats(); s.InFlightLimit != 8 {
+		t.Fatalf("denial moved the adaptive limit: %+v", s)
+	}
+}
+
+func TestWithAdmissionNil(t *testing.T) {
+	if _, err := New("x", WithAdmission(nil)); !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("err = %v", err)
+	}
+}
 
 // TestClockAdvanceRightAfterDo is the regression test for the synchronous
 // settle. Each iteration trips the circuit, advances the fake clock past the
@@ -1189,8 +1264,6 @@ func TestClockAdvanceRightAfterDo(t *testing.T) {
 	}
 }
 
-// --- model-based ---------------------------------------------------------
-
 // refModel is an independent, single-threaded reference implementation of
 // the breaker's contract. It is deliberately written from the documentation
 // rather than from breaker.go, so that TestModel compares two formulations of
@@ -1212,7 +1285,17 @@ type refModel struct {
 	openUntil        time.Time
 	consecutiveTrips int
 
-	calls, rejected, shed, admitted, successes, failures, canceled, trips uint64
+	calls, rejected, shed, denied, admitted, successes, failures, canceled, trips uint64
+}
+
+// deny models a call the admission veto refused after the circuit admitted
+// it: the admission is taken back and nothing else moves.
+func (m *refModel) deny(gen uint64) {
+	m.inFlight--
+	m.denied++
+	if gen == m.gen && m.state == HalfOpen {
+		m.probes--
+	}
 }
 
 func (m *refModel) expire(now time.Time) {
@@ -1245,12 +1328,12 @@ func (m *refModel) admit(now time.Time) (uint64, error) {
 		m.probes++
 	}
 	m.inFlight++
-	m.admitted++
 	return m.gen, nil
 }
 
 func (m *refModel) settle(gen uint64, out outcome, now time.Time) {
 	m.inFlight--
+	m.admitted++
 	switch out {
 	case _outcomeSuccess:
 		m.successes++
@@ -1320,7 +1403,7 @@ func (m *refModel) stats(now time.Time) Stats {
 	s := Stats{
 		State: m.state, ConsecutiveTrips: m.consecutiveTrips,
 		InFlight: m.inFlight, InFlightLimit: m.limit, Ramping: m.ramping,
-		Calls: m.calls, Rejected: m.rejected, Shed: m.shed, Admitted: m.admitted,
+		Calls: m.calls, Rejected: m.rejected, Shed: m.shed, Denied: m.denied, Admitted: m.admitted,
 		Successes: m.successes, Failures: m.failures, Canceled: m.canceled, Trips: m.trips,
 	}
 	if m.state == Open {
@@ -1391,6 +1474,7 @@ func runModel(t *testing.T, seed uint64, steps int) {
 		m.rampEnd = m.rampStart + rng.IntN(ceiling-m.rampStart+1)
 		opts = append(opts, WithRecoveryRamp(m.rampStart, m.rampEnd))
 	}
+	opts = append(opts, WithAdmission(denyIfMarked))
 	h := newHarness(t, opts...)
 	t.Logf("seed=%d failure=%d success=%d probes=%d inflight=%d ramp=%d..%d base=%s max=%s",
 		seed, m.failureThreshold, m.successThreshold, m.maxProbes, m.maxInFlight, m.rampStart, m.rampEnd, m.openBase, m.openMax)
@@ -1412,17 +1496,26 @@ func runModel(t *testing.T, seed uint64, steps int) {
 
 	for step := range steps {
 		switch r := rng.IntN(100); {
-		case r < 50: // start a call
+		case r < 50: // start a call; one in five is vetoed by the admission hook
 			c := &inflight{finish: make(chan outcome), done: make(chan error, 1)}
 			entered := make(chan struct{})
+			ctx := context.Background()
+			deny := rng.IntN(5) == 0
+			if deny {
+				ctx = context.WithValue(ctx, denyKey{}, true)
+			}
 			go func() {
-				_, err := h.Do(context.Background(), func(context.Context) (int, error) {
+				_, err := h.Do(ctx, func(context.Context) (int, error) {
 					close(entered)
 					return 0, outcomeErr(<-c.finish)
 				})
 				c.done <- err
 			}()
 			gen, wantErr := m.admit(h.clock.Now())
+			if wantErr == nil && deny {
+				m.deny(gen)
+				wantErr = errDenied
+			}
 			select {
 			case <-entered:
 				if wantErr != nil {
@@ -1431,7 +1524,7 @@ func runModel(t *testing.T, seed uint64, steps int) {
 				live = append(live, pending{c, gen})
 			case err := <-c.done:
 				if !errors.Is(err, wantErr) {
-					t.Fatalf("step %d: breaker rejected with %v, model expected %v", step, err, wantErr)
+					t.Fatalf("step %d: breaker returned %v, model expected %v", step, err, wantErr)
 				}
 			case <-time.After(10 * time.Second):
 				t.Fatalf("step %d: call neither admitted nor rejected", step)
@@ -1473,8 +1566,6 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 	}
 }
 
-// --- chaos ---------------------------------------------------------------
-
 // TestChaosInvariants hammers one breaker from many goroutines with random
 // outcomes, cancellations, clock advances and inspections, and checks the
 // properties that must hold at every observation regardless of interleaving.
@@ -1500,21 +1591,19 @@ func TestChaosInvariants(t *testing.T) {
 		WithOpenJitter(jitter),
 		WithOnStateChange(func(from, to State) { transitions = append(transitions, from, to) }),
 		WithObserver(counts),
+		WithAdmission(denyIfMarked),
 	)
 
 	checkSnapshot := func(t *testing.T, prev, s Stats) {
 		t.Helper()
-		if s.Admitted+s.Rejected+s.Shed != s.Calls {
-			t.Errorf("Admitted+Rejected+Shed != Calls: %+v", s)
+		if s.Admitted+s.Rejected+s.Shed+s.Denied+uint64(s.InFlight) != s.Calls {
+			t.Errorf("Admitted+Rejected+Shed+Denied+InFlight != Calls: %+v", s)
 		}
 		if s.InFlight < 0 || s.InFlight > maxInFlight {
 			t.Errorf("InFlight out of [0, %d]: %+v", maxInFlight, s)
 		}
-		if uint64(s.InFlight) != s.Admitted-(s.Successes+s.Failures+s.Canceled) {
-			t.Errorf("InFlight != admitted - settled: %+v", s)
-		}
-		if s.Successes+s.Failures+s.Canceled > s.Admitted {
-			t.Errorf("settled > admitted: %+v", s)
+		if s.Successes+s.Failures+s.Canceled != s.Admitted {
+			t.Errorf("settled != admitted: %+v", s)
 		}
 		if (s.State == Open) != (s.NextProbeIn > 0) {
 			t.Errorf("NextProbeIn inconsistent with state: %+v", s)
@@ -1542,6 +1631,8 @@ func TestChaosInvariants(t *testing.T) {
 					ctx, cancel := context.WithCancel(context.Background())
 					if r < 5 {
 						cancel() // acquire with a dead context
+					} else if r < 12 {
+						ctx = context.WithValue(ctx, denyKey{}, true) // vetoed after admission
 					}
 					h.Do(ctx, func(ctx context.Context) (int, error) {
 						switch x := rng.IntN(10); {
@@ -1573,7 +1664,7 @@ func TestChaosInvariants(t *testing.T) {
 	if final.Successes+final.Failures+final.Canceled != final.Admitted || final.InFlight != 0 {
 		t.Errorf("quiescent accounting broken: %+v", final)
 	}
-	if final.Trips == 0 || final.Rejected == 0 || final.Canceled == 0 {
+	if final.Trips == 0 || final.Rejected == 0 || final.Canceled == 0 || final.Denied == 0 {
 		t.Errorf("chaos did not exercise every path: %+v", final)
 	}
 
@@ -1583,7 +1674,7 @@ func TestChaosInvariants(t *testing.T) {
 	h.Stop()
 	if counts.calls[Success] != final.Successes || counts.calls[Failure] != final.Failures ||
 		counts.calls[Canceled] != final.Canceled || counts.calls[Rejected] != final.Rejected ||
-		counts.calls[Shed] != final.Shed || counts.trips != final.Trips {
+		counts.calls[Shed] != final.Shed || counts.calls[Denied] != final.Denied || counts.trips != final.Trips {
 		t.Errorf("observer tallies %v trips=%d disagree with Stats %+v", counts.calls, counts.trips, final)
 	}
 	legal := map[[2]State]bool{
@@ -1629,8 +1720,6 @@ func TestStopReleasesGoroutine(t *testing.T) {
 		t.Fatalf("%d goroutines before, %d after stopping 200 breakers", before, n)
 	}
 }
-
-// --- benchmarks ----------------------------------------------------------
 
 var _sink int
 

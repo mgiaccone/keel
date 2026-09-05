@@ -4,10 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"regexp"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/mgiaccone/keel/internal/promutil"
+)
+
+const (
+	_subsystem        = "breaker"
+	_defaultNamespace = "go"
 )
 
 // The package's metrics. Every breaker updates them from its state goroutine
@@ -22,7 +28,7 @@ import (
 //	go_breaker_in_flight{dependency}                                 gauge
 //	go_breaker_in_flight_limit{dependency}                           gauge, +Inf when unlimited
 //	go_breaker_ramping{dependency}                                   gauge, 1 during a recovery ramp
-//	go_breaker_calls_total{dependency,result="success|failure|canceled|rejected|shed"}  counter
+//	go_breaker_calls_total{dependency,result="success|failure|canceled|rejected|shed|denied"}  counter
 //	go_breaker_trips_total{dependency}                               counter
 var (
 	_stateGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -51,7 +57,7 @@ var (
 	}, []string{"dependency"})
 	_callsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: _subsystem, Name: "calls_total",
-		Help: "Calls that reached the breaker, by result. success+failure+canceled ran; rejected and shed did not.",
+		Help: "Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.",
 	}, []string{"dependency", "result"})
 	_tripsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: _subsystem, Name: "trips_total",
@@ -61,14 +67,10 @@ var (
 	_collectors = []prometheus.Collector{
 		_stateGauge, _openUntilGauge, _consecutiveTripsGauge, _inFlightGauge, _inFlightLimitGauge, _rampingGauge, _callsCounter, _tripsCounter,
 	}
-)
 
-const (
-	_subsystem        = "breaker"
-	_defaultNamespace = "go"
+	_allStates  = [...]State{Closed, Open, HalfOpen}
+	_allResults = [...]Result{Success, Failure, Canceled, Rejected, Shed, Denied}
 )
-
-var _reNamespace = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 // RegisterOption configures [Register].
 type RegisterOption func(*registerConfig) error
@@ -84,8 +86,8 @@ type registerConfig struct {
 // prefix: letters, digits and underscores, not starting with a digit.
 func WithNamespace(namespace string) RegisterOption {
 	return func(c *registerConfig) error {
-		if !_reNamespace.MatchString(namespace) {
-			return fmt.Errorf("%w: WithNamespace(%q): not a valid metric name prefix", ErrInvalidOption, namespace)
+		if err := promutil.ValidateNamespace(namespace); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidOption, err)
 		}
 		c.namespace = namespace
 		return nil
@@ -109,6 +111,7 @@ func WithNamespace(namespace string) RegisterOption {
 //	go_breaker_state{state="open"} == 1                          # open right now
 //	go_breaker_open_until_timestamp_seconds - time()             # seconds to next probe; negative = overdue, no traffic
 //	rate(go_breaker_calls_total{result=~"rejected|shed"}[5m])    # load being shed, by the circuit or the bulkhead
+//	rate(go_breaker_calls_total{result="denied"}[5m])            # vetoed by WithAdmission, e.g. rate limited
 //	go_breaker_in_flight / go_breaker_in_flight_limit            # bulkhead headroom
 //	go_breaker_ramping == 1                                      # recovery in progress; a low cap is expected
 //	increase(go_breaker_trips_total[10m]) > 3                    # flapping
@@ -126,13 +129,7 @@ func Register(reg prometheus.Registerer, opts ...RegisterOption) error {
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	reg = prometheus.WrapRegistererWithPrefix(cfg.namespace+"_", reg)
-	for _, c := range _collectors {
-		if err := reg.Register(c); err != nil {
-			return err
-		}
-	}
-	return nil
+	return promutil.Register(reg, cfg.namespace, _collectors...)
 }
 
 // MustRegister is [Register] for bootstrap code that treats a registration
@@ -151,7 +148,7 @@ type metricsObserver struct {
 	dep string
 
 	state            [3]prometheus.Gauge   // indexed by State
-	calls            [5]prometheus.Counter // indexed by Result
+	calls            [6]prometheus.Counter // indexed by Result
 	openUntil        prometheus.Gauge
 	consecutiveTrips prometheus.Gauge
 	inFlight         prometheus.Gauge
@@ -159,11 +156,6 @@ type metricsObserver struct {
 	ramping          prometheus.Gauge
 	trips            prometheus.Counter
 }
-
-var (
-	_allStates  = [...]State{Closed, Open, HalfOpen}
-	_allResults = [...]Result{Success, Failure, Canceled, Rejected, Shed}
-)
 
 // Started materialises every series at its initial value, so counters exist
 // at zero before the first event and rate() has a baseline.

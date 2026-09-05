@@ -94,6 +94,7 @@ type config struct {
 	maxInFlight      int   // static bulkhead; 0 = unlimited
 	aimd             *aimd // adaptive bulkhead; nil = off
 	ramp             *ramp // recovery ramp; nil = off
+	admission        func(context.Context) error
 	isFailure        func(error) bool
 	onStateChange    func(from, to State)
 	observers        []Observer
@@ -292,6 +293,30 @@ type ramp struct {
 	start, end int
 }
 
+// WithAdmission sets a veto that runs on the caller's goroutine after the
+// circuit has admitted a call and before fn is invoked. If it returns an
+// error, fn does not run, Do returns that error unchanged, and the call is
+// recorded as denied: it counts in Stats.Denied and as result="denied", not as
+// a failure, and it does not touch the circuit's failure run, the ramp or the
+// adaptive bulkhead.
+//
+// This is the seam for anything that must approve a call and may block or do
+// I/O to decide, which the state goroutine must never do: a rate limiter,
+// local or distributed, a quota check, an authorisation check. It runs after
+// admission so that an open circuit still answers ErrOpen and a call the
+// circuit would have refused never consumes the veto's quota. While it runs
+// the call holds its in-flight slot, so its latency is bounded by the
+// bulkhead like any other part of the call.
+func WithAdmission(fn func(context.Context) error) Option {
+	return func(c *config) error {
+		if fn == nil {
+			return fmt.Errorf("%w: WithAdmission(nil)", ErrInvalidOption)
+		}
+		c.admission = fn
+		return nil
+	}
+}
+
 // WithIsFailure sets the predicate that decides whether an error returned by
 // fn counts against the circuit. It is the most consequential setting and
 // should be set for every backend.
@@ -357,9 +382,12 @@ const (
 	Rejected
 	// Shed: fn did not run; the call got ErrBulkhead.
 	Shed
+	// Denied: fn did not run; the [WithAdmission] veto returned an error.
+	Denied
 )
 
-// String returns "success", "failure", "canceled", "rejected" or "shed".
+// String returns "success", "failure", "canceled", "rejected", "shed" or
+// "denied".
 func (r Result) String() string {
 	switch r {
 	case Success:
@@ -372,6 +400,8 @@ func (r Result) String() string {
 		return "rejected"
 	case Shed:
 		return "shed"
+	case Denied:
+		return "denied"
 	default:
 		return fmt.Sprintf("Result(%d)", uint8(r))
 	}
@@ -434,6 +464,10 @@ func WithSeed(a, b uint64) Option {
 	}
 }
 
+func defaultIsFailure(err error) bool {
+	return err != nil && !errors.Is(err, context.Canceled)
+}
+
 func defaultConfig() config {
 	return config{
 		failureThreshold: 5,
@@ -450,10 +484,13 @@ func defaultConfig() config {
 // Stats is a snapshot of the breaker, laid out to be read by a person during
 // an incident. All counters are cumulative since New.
 //
-// Invariants, which hold exactly after any Do has returned:
+// Invariants, which hold at every observation:
 //
-//	Admitted + Rejected + Shed == Calls
+//	Admitted + Rejected + Shed + Denied + InFlight == Calls
 //	Successes + Failures + Canceled == Admitted
+//
+// Every cumulative counter is monotonic; InFlight is the only field that
+// moves both ways.
 type Stats struct {
 	// Name is the breaker's name, as given to [New].
 	Name string
@@ -483,7 +520,10 @@ type Stats struct {
 	Rejected uint64
 	// Shed is calls refused with ErrBulkhead; fn never ran.
 	Shed uint64
-	// Admitted is calls for which fn ran.
+	// Denied is calls vetoed by [WithAdmission]; fn never ran.
+	Denied uint64
+	// Admitted is calls for which fn ran to completion. A call still running
+	// is in InFlight and not yet in Admitted.
 	Admitted uint64
 	// Successes is admitted calls whose outcome was a success per IsFailure.
 	Successes uint64
@@ -498,14 +538,14 @@ type Stats struct {
 
 // String renders the snapshot as one log line, for example:
 //
-//	breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 ok=760 fail=9 canceled=0 in_flight=3/64 next_probe_in=23s
+//	breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 denied=0 ok=760 fail=9 canceled=0 in_flight=3/64 next_probe_in=23s
 //
 // in_flight shows the cap after the slash only when one is set, followed by
 // "(ramping)" during a recovery ramp; next_probe_in is present only while
 // open.
 func (s Stats) String() string {
-	buf := fmt.Appendf(make([]byte, 0, 192), "breaker: name=%s state=%s trips=%d(consecutive=%d) calls=%d rejected=%d shed=%d ok=%d fail=%d canceled=%d in_flight=%d",
-		s.Name, s.State, s.Trips, s.ConsecutiveTrips, s.Calls, s.Rejected, s.Shed, s.Successes, s.Failures, s.Canceled, s.InFlight)
+	buf := fmt.Appendf(make([]byte, 0, 192), "breaker: name=%s state=%s trips=%d(consecutive=%d) calls=%d rejected=%d shed=%d denied=%d ok=%d fail=%d canceled=%d in_flight=%d",
+		s.Name, s.State, s.Trips, s.ConsecutiveTrips, s.Calls, s.Rejected, s.Shed, s.Denied, s.Successes, s.Failures, s.Canceled, s.InFlight)
 	if s.InFlightLimit > 0 {
 		buf = fmt.Appendf(buf, "/%d", s.InFlightLimit)
 	}
@@ -561,6 +601,7 @@ const (
 	_outcomeSuccess outcome = iota
 	_outcomeFailure
 	_outcomeCanceled
+	_outcomeDenied // admission veto: un-admit, count as denied, change nothing else
 )
 
 type settleMsg struct {
@@ -635,10 +676,6 @@ func New(name string, opts ...Option) (*Breaker, error) {
 	return b, nil
 }
 
-func defaultIsFailure(err error) bool {
-	return err != nil && !errors.Is(err, context.Canceled)
-}
-
 // Do runs fn under the breaker and returns its result.
 //
 // If the circuit is open, Do returns [ErrOpen] without invoking fn. If it is
@@ -671,6 +708,12 @@ func (b *Breaker) Do[T any](ctx context.Context, fn func(context.Context) (T, er
 	out := _outcomeFailure // a panic in fn leaves this set: counted as a failure
 	start := b.cfg.now()
 	defer func() { b.release(tok, gen, out, b.cfg.now().Sub(start)) }()
+	if b.cfg.admission != nil {
+		if err := b.cfg.admission(ctx); err != nil {
+			out = _outcomeDenied
+			return zero, err
+		}
+	}
 	if b.cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, b.cfg.timeout)
@@ -830,7 +873,7 @@ type machine struct {
 	openUntil        time.Time
 	consecutiveTrips int
 
-	calls, rejected, shed, admitted, successes, failures, canceled, trips uint64
+	calls, rejected, shed, denied, admitted, successes, failures, canceled, trips uint64
 }
 
 // run is the state goroutine. It exclusively owns every field of the machine:
@@ -857,7 +900,7 @@ func (b *Breaker) run() {
 			tok <- m.handleAdmit()
 		case msg := <-b.settle:
 			m.handleSettle(msg.gen, msg.out, msg.elapsed)
-			msg.tok <- 0 // ack: applied
+			msg.tok <- 0
 		case reply := <-b.inspect:
 			reply <- m.snapshot()
 		case <-b.stop:
@@ -924,6 +967,9 @@ func (m *machine) handleAdmit() uint64 {
 }
 
 // admitOrShed applies the bulkhead to a call the state machine would admit.
+// The call joins inFlight here and is counted as admitted only when it
+// settles, so Admitted stays monotonic even if the admission veto later
+// refuses it.
 func (m *machine) admitOrShed() uint64 {
 	if m.limit > 0 && m.inFlight >= m.limit {
 		m.shed++
@@ -931,7 +977,6 @@ func (m *machine) admitOrShed() uint64 {
 		return _replyBulkhead
 	}
 	m.inFlight++
-	m.admitted++
 	m.observeLoad()
 	return m.gen
 }
@@ -939,7 +984,19 @@ func (m *machine) admitOrShed() uint64 {
 func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	defer m.observeLoad() // after any transition below, so the cap it set is seen
 	m.inFlight--          // every admitted call settles exactly once, stale or not
+	if out == _outcomeDenied {
+		// The veto refused the call after the circuit let it through: it never
+		// ran, so it is denied rather than admitted, and nothing about the
+		// backend was learned.
+		m.denied++
+		m.observeCall(Denied)
+		if gen == m.gen && m.state == HalfOpen {
+			m.probesInFlight--
+		}
+		return
+	}
 	m.adapt(out, elapsed)
+	m.admitted++
 	switch out {
 	case _outcomeSuccess:
 		m.successes++
@@ -950,6 +1007,8 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	case _outcomeCanceled:
 		m.canceled++
 		m.observeCall(Canceled)
+	case _outcomeDenied:
+		// Counted before the stale check; a denial says nothing about the backend.
 	}
 	// A stale outcome belongs to a call admitted before the last transition.
 	// It has been counted above but must not drive the state machine: a slow
@@ -972,6 +1031,8 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 		case _outcomeCanceled:
 			// Neutral: the caller gave up, which says nothing about the
 			// backend. The failure run is neither extended nor reset.
+		case _outcomeDenied:
+			// Never reached: handled at the top of handleSettle.
 		}
 	case HalfOpen:
 		m.probesInFlight--
@@ -986,6 +1047,8 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 		case _outcomeCanceled:
 			// Neutral: the probe slot is freed above and the success run is
 			// left as it was.
+		case _outcomeDenied:
+			// Never reached: handled at the top of handleSettle.
 		}
 	case Open:
 		// Unreachable: entering Open bumps gen, so every in-flight call is
@@ -1019,6 +1082,8 @@ func (m *machine) adapt(out outcome, elapsed time.Duration) {
 		m.limit = max(m.limit/2, a.min)
 	case _outcomeCanceled:
 		// Neutral: the caller gave up; that says nothing about capacity.
+	case _outcomeDenied:
+		// Never reached: handleSettle returns before adapt for denials.
 	}
 }
 
@@ -1133,6 +1198,7 @@ func (m *machine) snapshot() Stats {
 		Calls:            m.calls,
 		Rejected:         m.rejected,
 		Shed:             m.shed,
+		Denied:           m.denied,
 		Admitted:         m.admitted,
 		Successes:        m.successes,
 		Failures:         m.failures,

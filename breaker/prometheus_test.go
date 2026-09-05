@@ -87,9 +87,10 @@ func TestMetricsSeriesExistAtZeroFromStart(t *testing.T) {
 	reg := registry(t)
 	newNamedHarness(t, "zero")
 	want := `
-# HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected and shed did not.
+# HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.
 # TYPE go_breaker_calls_total counter
 go_breaker_calls_total{dependency="zero",result="canceled"} 0
+go_breaker_calls_total{dependency="zero",result="denied"} 0
 go_breaker_calls_total{dependency="zero",result="failure"} 0
 go_breaker_calls_total{dependency="zero",result="rejected"} 0
 go_breaker_calls_total{dependency="zero",result="shed"} 0
@@ -119,9 +120,10 @@ func TestMetricsFollowEvents(t *testing.T) {
 	openUntil := strconv.FormatFloat(float64(h.clock.Now().Add(10*time.Second).UnixNano())/1e9, 'g', -1, 64)
 
 	want := `
-# HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected and shed did not.
+# HELP go_breaker_calls_total Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.
 # TYPE go_breaker_calls_total counter
 go_breaker_calls_total{dependency="events",result="canceled"} 1
+go_breaker_calls_total{dependency="events",result="denied"} 0
 go_breaker_calls_total{dependency="events",result="failure"} 2
 go_breaker_calls_total{dependency="events",result="rejected"} 1
 go_breaker_calls_total{dependency="events",result="shed"} 0
@@ -255,7 +257,7 @@ func TestManyBreakersOneRegistration(t *testing.T) {
 	if n, _ := testutil.GatherAndCount(reg, "go_breaker_state"); n != 3 {
 		t.Fatalf("go_breaker_state series after Stop = %d, want 3", n)
 	}
-	if n, _ := testutil.GatherAndCount(reg, "go_breaker_calls_total"); n != 5 {
-		t.Fatalf("go_breaker_calls_total series after Stop = %d, want 5", n)
+	if n, _ := testutil.GatherAndCount(reg, "go_breaker_calls_total"); n != 6 {
+		t.Fatalf("go_breaker_calls_total series after Stop = %d, want 6", n)
 	}
 }

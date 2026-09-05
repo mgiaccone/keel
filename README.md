@@ -1,8 +1,19 @@
-# breaker
+# keel
 
-A circuit breaker for Go whose state is owned by a single goroutine and
-reached only through channels. No mutexes, no atomics, no timers in the core.
-Ships a Prometheus collector. Requires Go 1.27 (`Do` is a generic method).
+[![ci](https://github.com/mgiaccone/keel/actions/workflows/ci.yml/badge.svg)](https://github.com/mgiaccone/keel/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/mgiaccone/keel.svg)](https://pkg.go.dev/github.com/mgiaccone/keel)
+
+Resilience primitives for Go whose state is owned by a single goroutine and
+reached only through channels. No mutexes, no atomics, no timers in the cores.
+Every package ships Prometheus metrics. Requires Go 1.27 (`Do` is a generic
+method).
+
+| Package | What it bounds |
+|---|---|
+| `github.com/mgiaccone/keel/breaker` | What happens to calls: stop calling a dependency that is down (circuit breaker), bound how many calls are in flight (bulkhead, static or AIMD), bound how long each may take (timeout), let traffic back gradually after an outage (recovery ramp). |
+| `github.com/mgiaccone/keel/ratelimit` | How fast calls start: an algorithm (GCRA, fixed window, sliding window) applied to a store (memory, or Redis for one quota across the fleet), as a net/http middleware or composed with the breaker so a throttled call shows up in the same log line and metrics. |
+
+## breaker
 
 ```go
 b, err := breaker.New("db-fallback",
@@ -30,7 +41,7 @@ if errors.Is(err, breaker.ErrOpen) || errors.Is(err, breaker.ErrProbeLimit) || e
 }
 ```
 
-See `example_test.go` for a complete cache-then-database repository.
+See `breaker/example_test.go` for a complete cache-then-database repository.
 
 ## When a breaker is the right tool
 
@@ -80,6 +91,7 @@ misconfiguration is caught at construction rather than at the first outage.
 | `WithMaxInFlight(n)` | unlimited | Bulkhead: calls at the cap get `ErrBulkhead` immediately, nothing queues. See below. |
 | `WithAdaptiveInFlight(min, max, target)` | off | Bulkhead whose cap moves by AIMD between the bounds. Opt-in; needs volume. See below. |
 | `WithRecoveryRamp(start, end)` | off | After a recovery, the cap starts at `start` and grows by one per success to `end`, then the steady limit resumes. See below. |
+| `WithAdmission(fn)` | none | A veto run on the caller's goroutine after the circuit admits a call; an error means fn does not run and the call is `denied`. The seam for rate limiters and anything else that may block to decide. |
 | `WithOpenJitter(f)` | 0.2 | ±fraction applied to each open interval. 0 disables. See below. |
 | `WithIsFailure(fn)` | `err != nil && !errors.Is(err, context.Canceled)` | Which errors count against the circuit. **Set this.** |
 | `WithOnStateChange(fn)` | none | Called synchronously on every transition. Log here. Must not call back into the breaker. |
@@ -192,6 +204,9 @@ that open period; `Stats.NextProbeIn` counts down to it.
 - When `Do` returns, the outcome has been applied. A subsequent `Stats`
   reflects it and any transition it caused has already been reported through
   `OnStateChange`. There is no barrier to call.
+- `Admitted + Rejected + Shed + Denied + InFlight == Calls` and
+  `Successes + Failures + Canceled == Admitted` hold at every observation, and
+  every cumulative counter is monotonic.
 - A stale outcome, from a call admitted before the most recent transition, is
   counted in the totals but never drives the state machine. A slow success
   from before a trip cannot close a circuit that has since opened.
@@ -224,7 +239,7 @@ sms, err := breaker.New("sms-gateway", ...)
 | `go_breaker_in_flight` | gauge | `dependency` |
 | `go_breaker_in_flight_limit` | gauge, +Inf when unlimited | `dependency` |
 | `go_breaker_ramping` | gauge, 1 during a recovery ramp | `dependency` |
-| `go_breaker_calls_total` | counter | `dependency`, `result` ∈ success, failure, canceled, rejected, shed |
+| `go_breaker_calls_total` | counter | `dependency`, `result` ∈ success, failure, canceled, rejected, shed, denied |
 | `go_breaker_trips_total` | counter | `dependency` |
 
 The names below assume the default namespace; with `WithNamespace` the
@@ -240,61 +255,139 @@ how you see that. `go_breaker_state{state="open"} == 1` is the alert and
 Custom instrumentation, such as OpenTelemetry, attaches through the same
 `Observer` interface the metrics use, via `WithObserver`.
 
+## ratelimit
+
+A rate limiter bounds how many calls *start* per unit of time, however fast
+they complete; the bulkhead bounds how many are *outstanding*. It stands on
+its own: hold API clients to their quotas in a middleware, pace a worker
+against a third party, or compose it with the breaker on an outbound path.
+
+```go
+// A limiter is an algorithm applied to records in a store.
+store, err := ratelimit.NewMemoryStore()                    // per instance
+store    := goredis.NewStore(client)                        // or one quota across the fleet
+limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   // 100/s per key, bursts of 20
+
+// Inbound, as a plain net/http middleware: allowed requests carry
+// X-RateLimit-Remaining; refused ones get Retry-After and 429.
+mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
+
+// Or decide by hand.
+d, err := limiter.Allow(ctx, key)   // d.Allowed, d.Remaining, d.RetryAfter
+
+// Outbound: compose with a breaker; refused calls are recorded as denied.
+b, err := breaker.New("db-fallback",
+    breaker.WithAdmission(ratelimit.Admission(limiter, "")),   // "" = one limit for the whole dependency
+    ...
+)
+```
+
+### Architecture
+
+```
+Algorithm   the rule, a pure function:  Step(state, now) → (state', decision)
+Store       where a key's state lives:   Get(key) → (state, version, now)
+                                          CompareAndSet(key, version, state', ttl)
+Limiter     Get, Step, CompareAndSet; retry on a version conflict
+```
+
+An algorithm is written once, in Go, as a pure function over three integers
+of state, and works against every store. A store knows nothing about rates:
+it keeps those integers per key, swaps them atomically by version, expires
+idle records, and owns the clock, so a fleet sharing a Redis store agrees on
+time. Adding an algorithm is one pure function; adding a store is one `Get`
+and one `CompareAndSet`, verified by the contract suite in
+`ratelimit/storetest`.
+
+| Algorithm | Guarantees | State | Trade-off |
+|---|---|---|---|
+| `GCRA(rate, burst)` | long-run average `rate`, bursts to `burst`; exactly a token bucket | 1 timestamp | The default for protecting a backend or pacing a client. |
+| `FixedWindow(limit, window)` | `limit` per aligned window | start, count | Simplest to state as a quota; admits up to 2×`limit` across a boundary. |
+| `SlidingWindow(limit, window)` | ≈`limit` in any window, from two aligned counters | start, current, previous | No boundary burst; a few percent off under uneven traffic. |
+
+| Store | Scope | Cost per decision | Notes |
+|---|---|---|---|
+| `NewMemoryStore()` | one process | a mutex; the step runs under it, so no conflicts | LRU-evicted beyond `WithMaxKeys`; injectable clock for tests. |
+| `goredis.NewStore(client)` | fleet-wide | 2 round trips: pipelined `TIME`+`HMGET`, then one Lua compare-and-set | Server time; records expire on the algorithm's TTL; Redis 5+ or Valkey. |
+
+A refusal that leaves the state unchanged is not written, so refused calls
+cost one read. On a distributed store two writers racing on one key see one
+succeed and one retry; `WithMaxAttempts` bounds the retries, after which
+`Allow` returns `ErrContention`, and `go_ratelimit_cas_conflicts_total` counts
+them. A store that can apply the step under its own lock implements the
+optional `Updater` and never conflicts; the memory store does.
+
+### Decisions and errors
+
+A refused call gets a `Decision` with `RetryAfter`, computed honestly by each
+algorithm for its own rule and what the `Retry-After` header should say;
+through `Admission` it is a `*LimitedError` matching `ErrLimited`. Nothing
+waits: a call over the limit is refused immediately.
+
+A store error is "could not decide", not "not allowed". `Allow` returns it,
+`Stats.Errors` and `result="error"` count it, `Admission` fails closed and
+`FailOpen(limiter, onError)` inverts that. The middleware fails open by
+default, because an API that goes down with its Redis is usually the worse
+outcome; `FailClosed()` answers 503 instead.
+
+Inbound, a refusal is a 429 because the client exceeded a quota that is
+theirs; outbound through the breaker it is your own capacity and becomes a
+503 at your boundary. The limiter does not know which.
+
+`Middleware` takes a `KeyFunc`: `KeyByHeader("X-API-Key")`,
+`KeyByRemoteAddr()`, `KeyGlobal()`, or your own that reads the authenticated
+tenant from the context. Options: `WithLimitedHandler` for a custom 429 body,
+`OnError` for logging, `WithoutRemainingHeader` for endpoints that should not
+reveal their limits.
+
+### Testing
+
+Algorithms are tested as pure functions with explicit times. Stores run the
+contract in `ratelimit/storetest`: absent keys, create, version conflicts,
+expiry, and lost-update-free concurrent compare-and-set. The Redis store runs
+it against a real server: `REDIS_ADDR` if set, otherwise a disposable
+`valkey/valkey:8-alpine` container started with the `docker` CLI (image
+overridable with `RATELIMIT_TEST_IMAGE`) and removed afterwards; skipped when
+Docker is unavailable.
+
+Metrics, registered once at bootstrap alongside the breaker's and namespaced
+the same way:
+
+```go
+breaker.Register(prometheus.DefaultRegisterer)
+ratelimit.Register(prometheus.DefaultRegisterer)   // go_ratelimit_*
+```
+
+| Metric | Type | Labels |
+|---|---|---|
+| `go_ratelimit_decisions_total` | counter | `limiter`, `algorithm`, `result` ∈ allowed, limited, error |
+| `go_ratelimit_cas_conflicts_total` | counter | `limiter`, `algorithm` |
+| `go_ratelimit_keys` | gauge, when the store can report it | `limiter`, `algorithm` |
+
+Keys are deliberately not a label: per-tenant or per-IP keys would be
+unbounded cardinality. Aggregate per limiter, and use the breaker's
+`result="denied"` for the per-dependency view.
+
 ## Alerting
 
 Alert on what the on-call engineer can act on, and aggregate across instances
 so a single flapping pod does not page. Every alert carries the `dependency`
 label, so Alertmanager can route each dependency to the team that owns it.
 
-```yaml
-groups:
-- name: breaker
-  rules:
-  # Fraction of instances whose circuit is open. Every breaker exports a
-  # closed series, so counting those gives the instance count.
-  - record: breaker:open_fraction
-    expr: |
-      sum by (dependency) (go_breaker_state{state="open"})
-        /
-      count by (dependency) (go_breaker_state{state="closed"})
+The rules live in `contrib/prometheus/alerts.yaml`, ready for
+`promtool check rules` and for dropping into your rule files. In outline:
 
-  # The dependency is down: most instances agree. Page.
-  # The `for` matters: the first open interval is 5s by default, and a
-  # single trip that recovers on its first probe must not page anyone.
-  - alert: BreakerOpenFleetWide
-    expr: breaker:open_fraction > 0.5
-    for: 2m
-    labels: { severity: page }
-    annotations:
-      summary: "{{ $labels.dependency }} circuit open on {{ $value | humanizePercentage }} of instances"
+| Rule | Severity | Fires when |
+|---|---|---|
+| `breaker:open_fraction` (recording) | | share of instances whose circuit is open, per dependency |
+| `BreakerOpenFleetWide` | page | more than half the instances are open for 2m: the dependency is down |
+| `BreakerFlapping` | ticket | more than 5 trips in 30m: half-recovering backend, or `IsFailure` counting healthy answers |
+| `BreakerSheddingMajority` | page | more than half of calls refused, by circuit or bulkhead, for 5m |
+| `BreakerBulkheadSaturated` | ticket | bulkhead at its cap for 5m outside a recovery ramp: the backend is slow, not down |
+| `BreakerMetricsAbsent` | ticket | no series for an expected dependency: a forgotten `Register` or a breaker never created |
+| `RateLimitRefusingMajority` | ticket | more than half of decisions refused for 10m |
+| `RateLimitErrors` | page | a limiter could not decide: its store is unreachable, and the middleware fails open |
 
-  # Repeated trips: the backend is half-recovering, or IsFailure is counting
-  # healthy answers as failures. Someone should look, not at 3am.
-  - alert: BreakerFlapping
-    expr: sum by (dependency) (increase(go_breaker_trips_total[30m])) > 5
-    labels: { severity: ticket }
-    annotations:
-      summary: "{{ $labels.dependency }} tripped {{ $value }} times in 30m"
-
-  # The user-facing symptom: calls that never ran, whether the circuit or the
-  # bulkhead refused them. A ratio, so low-volume paths need no per-service
-  # threshold.
-  - alert: BreakerSheddingMajority
-    expr: |
-      sum by (dependency) (rate(go_breaker_calls_total{result=~"rejected|shed"}[5m]))
-        /
-      sum by (dependency) (rate(go_breaker_calls_total[5m]))
-        > 0.5
-    for: 5m
-    labels: { severity: page }
-
-  # Guard: a forgotten Register or a service that never created the breaker
-  # looks exactly like "everything is fine".
-  - alert: BreakerMetricsAbsent
-    expr: absent(go_breaker_state{dependency="db-fallback"})
-    for: 10m
-    labels: { severity: ticket }
-```
 
   # Bulkhead saturation without an open circuit: the backend is slow, not
   # down. Usually a ticket; the timeout and the cap bound the damage. A
@@ -333,7 +426,7 @@ without another graph.
 
 ## Dashboard
 
-`grafana/breaker-dashboard.json` is an importable Grafana dashboard
+`contrib/grafana/keel.json` is an importable Grafana dashboard
 (Grafana 10+, Prometheus datasource). Import it via Dashboards → New → Import,
 pick your Prometheus datasource when prompted, and select dependencies with
 the `Dependency` variable.
@@ -347,6 +440,7 @@ the `Dependency` variable.
 | Trips | bars | Trips per interval, stacked by dependency. A comb is flapping. |
 | Open circuits | table | One row per open breaker with the countdown to the next probe and its consecutive trips. A negative countdown means idle past the deadline, waiting for a call. |
 | Per instance (collapsed) | state timeline | One row per breaker, Closed / Half-open / Open, for drill-down. |
+| Rate limiters (collapsed row) | time series, bar gauge | Decisions per second by result per limiter, the refused share, limiter errors, and per-key records kept. Filtered by the `Limiter` variable. |
 
 The per-instance panel collapses the one-hot `go_breaker_state` gauge into a
 single ordinal, which is the shape a state timeline wants:
@@ -398,7 +492,8 @@ instead of two.
 gofmt -l .                                   # empty
 go vet ./...
 go test -race -cpu 1,2,18 -count=5 ./...     # 1 CPU is where scheduler-order bugs surface
-go test -bench . -benchmem
+go test -bench . -benchmem ./breaker/
+go test -v ./ratelimit/goredis/              # the Lua against a real server: REDIS_ADDR, or a Valkey container via docker
 ```
 
 The suite has three layers beyond the per-property tests:
@@ -415,9 +510,21 @@ The suite has three layers beyond the per-property tests:
   per call, probe-slot release on panic, goroutine release on `Stop`, and
   free-list overflow each have a dedicated test.
 
+The rate limiter has its own tests for each algorithm's rule and `RetryAfter`,
+the fixed window's boundary burst and the sliding window's absence of one, key
+isolation, LRU eviction, concurrent accounting, and the breaker integration: a denied call
+never runs, an open circuit wins over the limiter, and a failing limiter fails
+closed.
+
 Every blocking wait in the suite carries a deadline, so a deadlock fails at a
 named line rather than hanging until the `go test` timeout. `-short` trims the
 model and chaos iterations.
 
-The only third-party dependency is `prometheus/client_golang`, used by the
-collector; the breaker itself uses the standard library alone.
+Third-party dependencies: `prometheus/client_golang` for the metrics, and
+`redis/go-redis` linked only by programs that import `ratelimit/goredis`. The
+state machines themselves use the standard library alone.
+
+## Status and licence
+
+`v0`: the API is settling and may still change between minor versions;
+`v1.0.0` will fix it. MIT licence, see `LICENSE`.

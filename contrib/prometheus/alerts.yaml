@@ -1,0 +1,72 @@
+# Prometheus alert and recording rules for keel. See README.md, "Alerting",
+# for the reasoning behind each threshold. Validate with:
+#   promtool check rules contrib/prometheus/alerts.yaml
+groups:
+- name: breaker
+  rules:
+  # Fraction of instances whose circuit is open. Every breaker exports a
+  # closed series, so counting those gives the instance count.
+  - record: breaker:open_fraction
+    expr: |
+      sum by (dependency) (go_breaker_state{state="open"})
+        /
+      count by (dependency) (go_breaker_state{state="closed"})
+
+  # The dependency is down: most instances agree. Page.
+  # The `for` matters: the first open interval is 5s by default, and a
+  # single trip that recovers on its first probe must not page anyone.
+  - alert: BreakerOpenFleetWide
+    expr: breaker:open_fraction > 0.5
+    for: 2m
+    labels: { severity: page }
+    annotations:
+      summary: "{{ $labels.dependency }} circuit open on {{ $value | humanizePercentage }} of instances"
+
+  # Repeated trips: the backend is half-recovering, or IsFailure is counting
+  # healthy answers as failures. Someone should look, not at 3am.
+  - alert: BreakerFlapping
+    expr: sum by (dependency) (increase(go_breaker_trips_total[30m])) > 5
+    labels: { severity: ticket }
+    annotations:
+      summary: "{{ $labels.dependency }} tripped {{ $value }} times in 30m"
+
+  # The user-facing symptom: calls that never ran, whether the circuit or the
+  # bulkhead refused them. A ratio, so low-volume paths need no per-service
+  # threshold.
+  - alert: BreakerSheddingMajority
+    expr: |
+      sum by (dependency) (rate(go_breaker_calls_total{result=~"rejected|shed"}[5m]))
+        /
+      sum by (dependency) (rate(go_breaker_calls_total[5m]))
+        > 0.5
+    for: 5m
+    labels: { severity: page }
+
+  # Guard: a forgotten Register or a service that never created the breaker
+  # looks exactly like "everything is fine".
+  - alert: BreakerMetricsAbsent
+    expr: absent(go_breaker_state{dependency="db-fallback"})
+    for: 10m
+    labels: { severity: ticket }
+
+- name: ratelimit
+  rules:
+  # Share of decisions refused, per limiter. High and sustained on an inbound
+  # limiter means a client is being throttled hard: a ticket to look at who,
+  # or at whether the quota is right. On an outbound limiter it means you are
+  # the one over quota.
+  - alert: RateLimitRefusingMajority
+    expr: |
+      sum by (limiter) (rate(go_ratelimit_decisions_total{result="limited"}[5m]))
+        /
+      sum by (limiter) (rate(go_ratelimit_decisions_total[5m]))
+        > 0.5
+    for: 10m
+    labels: { severity: ticket }
+
+  # A distributed limiter that cannot decide: Redis unreachable or replying
+  # oddly. The middleware fails open by default, so this is the only signal.
+  - alert: RateLimitErrors
+    expr: sum by (limiter) (rate(go_ratelimit_decisions_total{result="error"}[5m])) > 0
+    for: 2m
+    labels: { severity: page }
