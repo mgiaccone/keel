@@ -22,6 +22,8 @@ const (
 //	go_retry_calls_total{retrier,backoff,result="success|exhausted|aborted|canceled|budget"}  counter
 //	go_retry_attempts_total{retrier,backoff}                                                     counter, first attempts included
 //	go_retry_wait_seconds_total{retrier,backoff}                                                 counter, time asked to wait
+//	go_retry_hedges_total{retrier,backoff}                                                       counter, attempts WithHedge started
+//	go_retry_hedge_wins_total{retrier,backoff}                                                   counter, calls a hedge won
 var (
 	_callsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: _subsystem, Name: "calls_total",
@@ -36,7 +38,16 @@ var (
 		Help: "Seconds the retrier asked to wait between attempts.",
 	}, []string{"retrier", "backoff"})
 
-	_collectors = []prometheus.Collector{_callsCounter, _attemptsCounter, _waitCounter}
+	_hedgesCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: _subsystem, Name: "hedges_total",
+		Help: "Attempts started by WithHedge because the ones in flight had not answered in time; included in attempts_total.",
+	}, []string{"retrier", "backoff"})
+	_hedgeWinsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Subsystem: _subsystem, Name: "hedge_wins_total",
+		Help: "Calls whose winning attempt was a hedge; hedges that did not win were load for nothing.",
+	}, []string{"retrier", "backoff"})
+
+	_collectors = []prometheus.Collector{_callsCounter, _attemptsCounter, _waitCounter, _hedgesCounter, _hedgeWinsCounter}
 
 	_allResults = [...]Result{Success, Exhausted, Aborted, Canceled, Budget}
 )
@@ -99,9 +110,11 @@ func MustRegister(reg prometheus.Registerer, opts ...RegisterOption) {
 type metricsObserver struct {
 	name, backoff string
 
-	calls    [5]prometheus.Counter // indexed by Result
-	attempts prometheus.Counter
-	wait     prometheus.Counter
+	calls     [5]prometheus.Counter // indexed by Result
+	attempts  prometheus.Counter
+	wait      prometheus.Counter
+	hedges    prometheus.Counter
+	hedgeWins prometheus.Counter
 }
 
 func (o *metricsObserver) Started() {
@@ -113,8 +126,18 @@ func (o *metricsObserver) Started() {
 	o.attempts.Add(0)
 	o.wait = _waitCounter.WithLabelValues(o.name, o.backoff)
 	o.wait.Add(0)
+	o.hedges = _hedgesCounter.WithLabelValues(o.name, o.backoff)
+	o.hedges.Add(0)
+	o.hedgeWins = _hedgeWinsCounter.WithLabelValues(o.name, o.backoff)
+	o.hedgeWins.Add(0)
 }
 
 func (o *metricsObserver) Attempt(int)                 { o.attempts.Inc() }
+func (o *metricsObserver) Hedge(int)                   { o.hedges.Inc() }
 func (o *metricsObserver) Wait(_ int, d time.Duration) { o.wait.Add(d.Seconds()) }
 func (o *metricsObserver) Call(result Result, _ int)   { o.calls[result].Inc() }
+
+// hedgeWon is not an [Observer] method: Call cannot say which attempt won,
+// and widening the interface for one counter is not worth it. The retrier
+// calls it directly; custom observers read wins from [Stats].
+func (o *metricsObserver) hedgeWon() { o.hedgeWins.Inc() }

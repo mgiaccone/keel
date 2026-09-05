@@ -9,7 +9,7 @@ Resilience primitives for Go. Requires Go 1.27.
 |---|---|
 | [`breaker`](docs/breaker.md) | What happens to calls: circuit breaker tripped by consecutive failures or an error rate, bulkhead (static or adaptive), per-call timeout, recovery ramp, admission veto. |
 | [`ratelimit`](docs/ratelimit.md) | How fast calls start: GCRA, fixed window or sliding window over a memory or Redis store, as a `net/http` middleware or composed with the breaker. |
-| [`retry`](docs/retry.md) | How many times a call is attempted: four jittered schedules, a retry budget, `Retry-After`, an `http.RoundTripper`. |
+| [`retry`](docs/retry.md) | How many times a call is attempted: four jittered schedules, hedging against slow attempts, a retry budget, `Retry-After`, an `http.RoundTripper`. |
 
 ## Install
 

@@ -8,9 +8,10 @@ import (
 // Backoff is a retry schedule as a pure function. Delay returns the wait
 // before retry n, counting from 1 for the first retry, given the previous
 // wait, 0 before the first, and u, a uniform draw in [0, 1) that the retrier
-// supplies from its own seeded generator. A Backoff must not keep state or
-// read a clock, so the same schedule gives the same waits everywhere and is
-// tested with explicit inputs.
+// supplies from its own seeded generator. Under [WithHedge] n is the number
+// of attempts that have failed so far, hedges included. A Backoff must not
+// keep state or read a clock, so the same schedule gives the same waits
+// everywhere and is tested with explicit inputs.
 //
 // Every schedule except [Constant] is jittered. Unjittered retries from a
 // fleet that failed together arrive together, and a dependency that is

@@ -93,7 +93,9 @@ groups:
   rules:
   # Retries per call: attempts beyond the first, over calls. Attempts are
   # counted when they start and calls when they end, so the ratio is exact
-  # only over a window longer than a call, which 5m is.
+  # only over a window longer than a call, which 5m is. Hedges are attempts
+  # too, so a hedging retrier is held to the same amplification bound; no
+  # separate rule is needed for them.
   - record: retry:retries_per_call
     expr: |
       (

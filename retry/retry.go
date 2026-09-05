@@ -19,6 +19,11 @@
 // retrier's: a retried write that is not idempotent is applied twice. Mark
 // such errors with [Permanent], or classify them in [WithRetryIf].
 //
+// A retry helps when an attempt fails; a hedge ([WithHedge]) helps when an
+// attempt is slow, by starting another before the first has answered. It
+// needs idempotency even more than a retry, since both attempts may run to
+// completion, and the budget even more, since it adds load on purpose.
+//
 // # Deciding what to retry
 //
 // An error that implements [Retryable] decides for itself. The breaker's
@@ -126,14 +131,17 @@ func (e *permanentError) Retryable() bool { return false }
 
 // Observer receives the retrier's events, on the goroutine running the call,
 // in the order they happen: Started once from [New]; Attempt before every
-// attempt, numbered from 1; Wait before every wait, with the retry it
-// precedes numbered from 1; Call once when the call ends, with how many
-// attempts it took. Implementations must return promptly. The Prometheus
-// metrics are one implementation.
+// attempt, numbered from 1; Hedge right after the Attempt of an attempt that
+// [WithHedge] started, and never otherwise; Wait before every wait, with the
+// number of attempts that have failed so far, which is the retry number
+// without hedging; Call once when the call ends, with how many attempts it
+// took. Implementations must return promptly. The Prometheus metrics are one
+// implementation.
 type Observer interface {
 	Started()
 	Attempt(attempt int)
-	Wait(retry int, d time.Duration)
+	Hedge(attempt int)
+	Wait(failed int, d time.Duration)
 	Call(result Result, attempts int)
 }
 
@@ -147,6 +155,7 @@ type config struct {
 	backoff       Backoff
 	maxAttempts   int
 	maxRetryAfter time.Duration
+	hedge         time.Duration // 0 = off
 	retryIf       func(error) bool
 	budget        func(context.Context) error
 	onRetry       func(attempt int, err error, delay time.Duration)
@@ -201,10 +210,48 @@ func WithMaxRetryAfter(d time.Duration) Option {
 	}
 }
 
-// WithBudget sets a veto asked before every retry, never before the first
-// attempt. A non-nil error ends the call as [Budget], returning the last
-// error from fn; the veto's own error goes to the hook and the observers. It
-// takes the shape ratelimit.Admission returns, so
+// WithHedge starts another attempt when the ones in flight have not answered
+// after d, up to [WithMaxAttempts]. The first success wins; the rest are
+// cancelled through their contexts and their results discarded. Off by
+// default.
+//
+// A retry helps when an attempt fails; a hedge helps when an attempt is slow.
+// It cuts the latency tail that a few slow replicas cause, at the cost of
+// extra load, and against a dependency that is uniformly slow it only doubles
+// that load. Hedges need idempotency even more than retries, since two
+// attempts may both run to completion, and fn is called concurrently with
+// itself. Hedge only with a budget.
+//
+// A hedge asks the budget like a retry, and a refusal ends every further
+// attempt of the call: the attempts in flight finish and decide it. Hedges
+// count against the attempt cap together with retries. A failure while other
+// attempts are running starts nothing; once every attempt in flight has
+// failed, the ordinary retry path applies with the schedule's wait, which d
+// does not floor, and the schedule is asked for the wait after that many
+// failed attempts, hedges included. A failure that must not be retried, or
+// the caller's context ending, cancels the other attempts and ends the call
+// at once.
+//
+// Each attempt runs on a context derived from the caller's. The losers'
+// contexts end when the call does; the winner's is left alive, since the
+// value it produced may keep using it after Do returns, an HTTP body for
+// one, and it ends with the caller's. Hedge under a per-call context: under
+// a service-lifetime cancellable context, every winner's context stays
+// registered in it until it ends.
+func WithHedge(after time.Duration) Option {
+	return func(c *config) error {
+		if after <= 0 {
+			return fmt.Errorf("%w: WithHedge(%s): must be positive", ErrInvalidOption, after)
+		}
+		c.hedge = after
+		return nil
+	}
+}
+
+// WithBudget sets a veto asked before every retry and every hedge, never
+// before the first attempt. A non-nil error ends the call as [Budget],
+// returning the last error from fn; the veto's own error goes to the hook and
+// the observers. It takes the shape ratelimit.Admission returns, so
 //
 //	retry.WithBudget(ratelimit.Admission(limiter, ""))
 //
@@ -299,13 +346,15 @@ func defaultRetryIf(error) bool { return true }
 // [New]; the zero value is not usable. It has no goroutine and nothing to
 // stop; its counters are atomics and it is safe for concurrent use.
 type Retrier struct {
-	cfg config
+	cfg     config
+	metrics *metricsObserver // the first observer; hedge wins reach it directly
 
 	mu  sync.Mutex // guards rng, which is not safe for concurrent use
 	rng *rand.Rand
 
 	attempts                                        atomic.Uint64
 	succeeded, exhausted, aborted, canceled, budget atomic.Uint64
+	hedges, hedgeWins                               atomic.Uint64
 	waited                                          atomic.Int64
 }
 
@@ -340,11 +389,12 @@ func New(name string, backoff Backoff, opts ...Option) (*Retrier, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
-	cfg.observers = append([]Observer{&metricsObserver{name: name, backoff: backoff.Name()}}, cfg.observers...)
+	metrics := &metricsObserver{name: name, backoff: backoff.Name()}
+	cfg.observers = append([]Observer{metrics}, cfg.observers...)
 	if cfg.seed == [2]uint64{} {
 		cfg.seed = [2]uint64{rand.Uint64(), rand.Uint64()}
 	}
-	r := &Retrier{cfg: cfg, rng: rand.New(rand.NewPCG(cfg.seed[0], cfg.seed[1]))}
+	r := &Retrier{cfg: cfg, metrics: metrics, rng: rand.New(rand.NewPCG(cfg.seed[0], cfg.seed[1]))}
 	for _, o := range cfg.observers {
 		o.Started()
 	}
@@ -358,13 +408,33 @@ func New(name string, backoff Backoff, opts ...Option) (*Retrier, error) {
 // when it is the outermost one. The one exception is a context that is
 // already done before fn ever ran, where Do returns ctx.Err().
 //
-// Each attempt receives ctx as given. Bound the attempt, not the call: wrap
-// fn in a breaker with WithTimeout, or derive a per-attempt context inside
-// fn. A deadline on ctx bounds the whole call, waits included.
+// Each attempt receives ctx as given, or a context derived from it under
+// [WithHedge], where attempts run concurrently and the losers are cancelled.
+// Bound the attempt, not the call: wrap fn in a breaker with WithTimeout, or
+// derive a per-attempt context inside fn. A deadline on ctx bounds the whole
+// call, waits included.
+//
+// A panic in fn propagates to the caller; under WithHedge the other attempts
+// are cancelled first, and a losing attempt that panics after the call has
+// returned panics on its own goroutine rather than being swallowed.
+//
+// Because Do may hand fn to other goroutines under WithHedge, a closure that
+// captures variables is heap-allocated whether or not hedging is on; the
+// retrier itself allocates nothing on the success path without WithHedge.
 //
 // Do is a generic method and therefore cannot be part of an interface; put a
 // non-generic adapter in front of it if one is needed.
 func (r *Retrier) Do[T any](ctx context.Context, fn func(context.Context) (T, error)) (T, error) {
+	return do(r, ctx, fn, nil)
+}
+
+// do is Do with a hook for the results the call does not return: the failed
+// result a retry supersedes, and the losers of a hedge race. The transport
+// uses it to close response bodies the caller never sees. discard may be nil.
+func do[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T, error), discard func(T, error)) (T, error) {
+	if r.cfg.hedge > 0 {
+		return hedged(r, ctx, fn, discard)
+	}
 	var (
 		v        T
 		last     error
@@ -378,6 +448,9 @@ func (r *Retrier) Do[T any](ctx context.Context, fn func(context.Context) (T, er
 				return v, ctx.Err()
 			}
 			return v, unwrapPermanent(last)
+		}
+		if attempts > 0 && discard != nil {
+			discard(v, last) // superseded by the attempt about to start
 		}
 		attempts++
 		r.attempts.Add(1)
@@ -478,10 +551,14 @@ func unwrapPermanent(err error) error {
 //	Succeeded + Exhausted + Aborted + Canceled + BudgetDenied == Calls
 //
 // holds at every observation; Attempts >= Calls, since a call's attempts are
-// counted before it ends. Every counter is monotonic.
+// counted before it ends; Hedged <= Attempts - Calls, since a hedge is never
+// a first attempt; and HedgeWon <= min(Hedged, Succeeded). Every counter is
+// monotonic.
 type Stats struct {
 	// Name and Backoff identify the retrier.
 	Name, Backoff string
+	// HedgeAfter is the [WithHedge] delay; 0 when hedging is off.
+	HedgeAfter time.Duration
 	// Calls is calls through Do that have ended, by any result.
 	Calls uint64
 	// Attempts is invocations of fn, first attempts included.
@@ -489,26 +566,36 @@ type Stats struct {
 	// Succeeded, Exhausted, Aborted, Canceled and BudgetDenied count calls
 	// by [Result].
 	Succeeded, Exhausted, Aborted, Canceled, BudgetDenied uint64
+	// Hedged is attempts started by [WithHedge]; HedgeWon is calls whose
+	// winning attempt was one of them.
+	Hedged, HedgeWon uint64
 	// Waited is the total time the retrier has asked to wait, whether or not
-	// a wait ran to completion.
+	// a wait ran to completion. Hedge delays are not waits.
 	Waited time.Duration
 }
 
 // String renders the snapshot as one log line:
 //
-//	retry: name=db backoff=exponential calls=812 attempts=901 ok=800 exhausted=5 aborted=7 canceled=0 budget=0 waited=1m2s
+//	retry: name=db backoff=exponential calls=812 attempts=901 ok=800 exhausted=5 aborted=7 canceled=0 budget=0 waited=1m2s hedged=40 hedge_won=31
+//
+// hedged and hedge_won are present only under [WithHedge].
 func (s Stats) String() string {
-	return fmt.Sprintf("retry: name=%s backoff=%s calls=%d attempts=%d ok=%d exhausted=%d aborted=%d canceled=%d budget=%d waited=%s",
+	buf := fmt.Appendf(make([]byte, 0, 160), "retry: name=%s backoff=%s calls=%d attempts=%d ok=%d exhausted=%d aborted=%d canceled=%d budget=%d waited=%s",
 		s.Name, s.Backoff, s.Calls, s.Attempts, s.Succeeded, s.Exhausted, s.Aborted, s.Canceled, s.BudgetDenied, s.Waited)
+	if s.HedgeAfter > 0 {
+		buf = fmt.Appendf(buf, " hedged=%d hedge_won=%d", s.Hedged, s.HedgeWon)
+	}
+	return string(buf)
 }
 
 // Stats returns a snapshot.
 func (r *Retrier) Stats() Stats {
 	s := Stats{
-		Name: r.cfg.name, Backoff: r.cfg.backoff.Name(),
+		Name: r.cfg.name, Backoff: r.cfg.backoff.Name(), HedgeAfter: r.cfg.hedge,
 		Attempts:  r.attempts.Load(),
 		Succeeded: r.succeeded.Load(), Exhausted: r.exhausted.Load(), Aborted: r.aborted.Load(),
 		Canceled: r.canceled.Load(), BudgetDenied: r.budget.Load(),
+		Hedged: r.hedges.Load(), HedgeWon: r.hedgeWins.Load(),
 		Waited: time.Duration(r.waited.Load()),
 	}
 	s.Calls = s.Succeeded + s.Exhausted + s.Aborted + s.Canceled + s.BudgetDenied

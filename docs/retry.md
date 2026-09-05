@@ -58,8 +58,15 @@ write that is not idempotent is applied twice; the retrier cannot know. Mark
 such errors `Permanent`, or exclude them in `WithRetryIf`. The HTTP transport
 applies the rule `net/http` applies to its own replays.
 
-The retrier does not hedge. Sending a duplicate request before the first has
-failed is a different tool with different failure modes.
+A hedge is the opposite kind of tool: a retry helps when an attempt fails, a
+hedge helps when an attempt is slow. `WithHedge(after)` starts another
+attempt when the ones in flight have not answered within `after`; the first
+success wins and the rest are cancelled. It cuts the latency tail that a few
+slow replicas cause. Against a dependency that is uniformly slow it doubles
+the load and helps nobody, and during an outage it is amplification on
+purpose, so hedge only with a budget, and only where the tail comes from
+replicas rather than from the request itself. Hedges need idempotency even
+more than retries: two attempts may both run to completion.
 
 ## How it works
 
@@ -88,6 +95,60 @@ returned.
 A context that is already done before the first attempt ends the call as
 canceled with `ctx.Err()`, the only case where `Do` returns an error `fn` did
 not.
+
+### Hedging
+
+`WithHedge(after)` runs attempts concurrently. Each gets its own context
+derived from the caller's, and `fn` is called concurrently with itself,
+which is a requirement of the option. The rules:
+
+1. Attempt 1 starts and a timer is armed for `after`.
+2. The timer fires with attempts in flight. If the cap allows and the budget
+   has not refused this call, the budget is asked; refused, the `WithOnRetry`
+   hook sees the veto's error, no further attempt of any kind starts for
+   this call, and the running ones finish it. Allowed, a hedge starts,
+   `Attempt` and then `Hedge` reach the observers, and the timer is
+   re-armed.
+3. A success ends the call at once: every other attempt is cancelled and
+   `Do` does not wait for them. Their results are discarded. The winner's
+   context is left alive, since the value it produced may keep using it
+   after `Do` returns, an HTTP body for one; it ends with the caller's.
+4. A failure while other attempts are running is classified. Not retryable,
+   or asking for a delay above `WithMaxRetryAfter`: the others are cancelled
+   and the call is **aborted** with that error. The caller's context is done:
+   **canceled**, with that error. Retryable: nothing starts because of it,
+   the timer keeps running, and the error is what `Do` returns if nothing
+   better arrives.
+5. A failure with nothing else in flight takes the ordinary path of the
+   attempt loop: the cap, the budget (a refusal earlier in the call still
+   holds), the schedule's wait plus any delay floor, the hook and the
+   observers, the sleep. The next attempt is a retry, not a hedge, and the
+   timer is re-armed for it. The hedge delay does not floor the schedule's
+   wait; the two are independent. The schedule is asked for the wait after
+   that many failed attempts, hedges included, so two attempts failing
+   together back off as far as two failing in turn.
+6. The timer fires after the caller's context has ended: nothing starts and
+   the timer is not re-armed; the attempts have been cancelled through their
+   contexts and rule 4 ends the call when one answers.
+7. A panic in any attempt is recovered on its goroutine, the other attempts
+   are cancelled, and the panic is raised again on the caller's goroutine. A
+   loser that panics after the call has returned panics on its own
+   goroutine: a panic in `fn` is a bug and is not swallowed.
+8. `Do` returns what the last attempt to answer returned, with `Permanent`
+   unwrapped as always. Hedges count against the attempt cap together with
+   retries. `Stats.Hedged` counts hedges started and `Stats.HedgeWon` calls a
+   hedge won; a hedge that did not win was load for nothing, and the ratio
+   is how to judge `after`.
+
+The results a call does not return, the failed result a retry supersedes
+and the losers of a hedge race, go to an internal hook the transport uses to
+close response bodies the caller never sees. Without hedging, `Do` is the
+sequential loop above and allocates nothing on success.
+
+Hedge under a per-call context. Every attempt's context is derived from the
+caller's; the losers' end with the call, the winner's only with the
+caller's, so under a service-lifetime cancellable context each winner stays
+registered in it until it ends.
 
 ### Schedules
 
@@ -171,6 +232,12 @@ error, whatever ended them, so the caller sees the 503 rather than an error
 the retrier made up. A transport error that ends the retries is returned as
 is.
 
+Under `WithHedge` the same replay rule decides whether a request may be
+hedged: a request the transport would not retry is not hedged either, and
+goes through once. A losing attempt's response is drained and closed
+whenever it arrives, before or after the winner has been returned to the
+caller; the transport never leaks a body.
+
 ## Configuration
 
 ### Retrier
@@ -182,7 +249,8 @@ option.
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithMaxAttempts(n)` | 3 | Attempts per call, the first included. 1 disables retries. |
+| `WithMaxAttempts(n)` | 3 | Attempts per call, the first included, hedges included. 1 disables retries. |
+| `WithHedge(after)` | off | Starts another attempt when the ones in flight have not answered after `after`; see Hedging. |
 | `WithRetryIf(fn)` | retry every error | Predicate for errors that do not implement `Retryable`. |
 | `WithMaxRetryAfter(d)` | 30s | Longest delay a `Delayed` error may ask for; longer aborts the call. |
 | `WithBudget(fn)` | none | Veto asked before every retry. |
@@ -248,31 +316,40 @@ creates for a retried response, reports true and the `Retry-After` header.
 
 ### `Stats`
 
-`Stats` returns the name, schedule, and the cumulative counters `Calls`,
-`Attempts`, `Succeeded`, `Exhausted`, `Aborted`, `Canceled` and
-`BudgetDenied`, plus `Waited`, the total time the retrier asked to wait.
+`Stats` returns the name, schedule and hedge delay (`HedgeAfter`, 0 when
+off), the cumulative counters `Calls`, `Attempts`, `Succeeded`, `Exhausted`,
+`Aborted`, `Canceled`, `BudgetDenied`, `Hedged` and `HedgeWon`, plus
+`Waited`, the total time the retrier asked to wait, hedge delays excluded.
 `Calls` is the sum of the five result counters, so
 
 ```
 Succeeded + Exhausted + Aborted + Canceled + BudgetDenied == Calls
 Attempts >= Calls
+Hedged <= Attempts - Calls
+HedgeWon <= min(Hedged, Succeeded)
 ```
 
 hold at every observation. `Stats.String` renders one line:
 
 ```
-retry: name=catalogue backoff=exponential calls=812 attempts=901 ok=800 exhausted=5 aborted=7 canceled=0 budget=0 waited=1m2s
+retry: name=catalogue backoff=exponential calls=812 attempts=901 ok=800 exhausted=5 aborted=7 canceled=0 budget=0 waited=1m2s hedged=40 hedge_won=31
 ```
+
+`hedged` and `hedge_won` appear only under `WithHedge`.
 
 ### Guarantees
 
 - `Do` returns what the last attempt returned, or `ctx.Err()` when nothing
   ran.
-- The budget is asked once per retry, never for a first attempt.
+- The budget is asked once per retry and once per hedge, never for a first
+  attempt; a hedge never starts without its consent.
 - A `Delayed` error is waited for at least its delay or not at all.
-- The transport never sends a request `net/http` would not replay, and never
-  returns a response whose body it has consumed.
-- The success path allocates nothing.
+- The transport never sends a request `net/http` would not replay, never
+  returns a response whose body it has consumed, and closes every response
+  the caller does not receive.
+- The retrier itself allocates nothing on the success path without
+  `WithHedge`; a closure passed to `Do` that captures variables is
+  heap-allocated by the caller, see Benchmarks.
 
 ## Composing
 
@@ -307,9 +384,16 @@ retry ends the call as budget and returns the dependency's last error.
 ### With other telemetry
 
 `WithObserver` attaches an `Observer` that receives `Started`, `Attempt`,
-`Wait` and `Call`, in order, on the goroutine running the call. The
+`Hedge`, `Wait` and `Call`, in order, on the goroutine running the call. The
 Prometheus metrics are one implementation of this interface. Observers must
 return promptly.
+
+`Hedge` was added in v0.5.0 with `WithHedge`; an observer written before it
+needs the method, an empty one if hedges are of no interest. It follows the
+`Attempt` of an attempt a hedge started and is never delivered otherwise.
+`Call` cannot say which attempt won, so hedge wins are read from `Stats`.
+`Wait`'s first argument is the number of attempts that have failed so far,
+which is the retry number without hedging.
 
 ## Observability
 
@@ -326,16 +410,19 @@ returns and persist for the life of the process.
 | `go_retry_calls_total` | counter | `retrier`, `backoff`, `result` ∈ success, exhausted, aborted, canceled, budget |
 | `go_retry_attempts_total` | counter, first attempts included | `retrier`, `backoff` |
 | `go_retry_wait_seconds_total` | counter | `retrier`, `backoff` |
+| `go_retry_hedges_total` | counter, included in attempts | `retrier`, `backoff` |
+| `go_retry_hedge_wins_total` | counter | `retrier`, `backoff` |
 
 Common queries:
 
 ```promql
 (rate(go_retry_attempts_total[5m]) - rate(go_retry_calls_total[5m]))
-  / rate(go_retry_calls_total[5m])                                     # retries per call
+  / rate(go_retry_calls_total[5m])                                     # retries per call, hedges included
 rate(go_retry_calls_total{result="exhausted"}[5m])
   / rate(go_retry_calls_total[5m])                                     # share of calls that gave up
-rate(go_retry_calls_total{result="budget"}[5m])                        # retries the budget refused
+rate(go_retry_calls_total{result="budget"}[5m])                        # retries and hedges the budget refused
 rate(go_retry_wait_seconds_total[5m])                                  # goroutine-seconds per second spent waiting
+rate(go_retry_hedge_wins_total[5m]) / rate(go_retry_hedges_total[5m])  # hedges that were worth it; low means after is too short
 ```
 
 ### Alerting
@@ -360,7 +447,8 @@ an incident is the budget doing its job and needs no alert.
 ### Dashboard
 
 `contrib/grafana/keel.json` includes a collapsed row for retriers: retries
-per call, calls by result, and time spent waiting.
+per call, calls by result with hedges started as a dashed series, and time
+spent waiting.
 
 ## Testing
 
@@ -378,6 +466,20 @@ idempotency headers and the opt-in, body replay, pass-through of a
 non-replayable body, `Retry-After` in both forms, the cap, release of retried
 bodies, transport errors, and the last response being returned open.
 
+Hedging is tested with a gated `fn` whose attempts block until the test
+releases them and a hedge timer that fires only when the test says so, so
+every ordering in the rules above is reproduced exactly: a hedge
+overtaking a slow attempt and the loser's context being cancelled, a
+hedge's failure not ending the call, a permanent failure aborting it, every
+attempt failing into the retry path, the budget before each hedge and its
+refusal holding, the cap, the caller cancelling, a panic reaching the
+caller, and the internal discard hook seeing every superseded result and
+nothing else. A chaos test with random latencies, outcomes and
+cancellations checks the `Stats` identities under the race detector. The
+transport is tested with a stalled first request, a hedge answering 503
+with a body too large to buffer, and the stalled request winning: the 503
+body must end up closed and the winner's open.
+
 ## Benchmarks
 
 `go test -bench . -benchmem ./retry/` on an Apple M5 Max (18 cores), Go
@@ -385,11 +487,17 @@ bodies, transport errors, and the last response being returned open.
 
 | Benchmark | ns/op | B/op | allocs/op |
 |---|---:|---:|---:|
-| `Do`, success first attempt | 6.3 | 0 | 0 |
-| `Do`, two retries, no-op sleep | 114 | 64 | 4 |
+| `Do`, success first attempt | 6.5 | 0 | 0 |
+| `Do`, success first attempt, `WithHedge` set | 1380 | 1176 | 17 |
+| `Do`, two retries, no-op sleep | 128 | 88 | 6 |
 
 The success path is a closure call and three atomic increments. The retry
 path adds classification through `errors.As`, the schedule and the
-observers; the allocations are the benchmark's own closure and the
-interface conversions in classification. A real retry waits for the
-schedule, which dwarfs everything above.
+observers; the allocations are the interface conversions in classification
+plus the benchmark's own closure and the counter it captures. That closure
+is heap-allocated since v0.5.0: `Do` may hand `fn` to other goroutines under
+`WithHedge`, so a closure that captures variables escapes whether or not
+hedging is on. A function value that captures nothing still costs nothing.
+The hedged path pays for the attempt goroutine, its context, the results
+channel and the timer goroutine on every call, even when no hedge starts. A
+real retry waits for the schedule, which dwarfs everything above.

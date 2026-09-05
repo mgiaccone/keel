@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -94,6 +95,11 @@ func WithRetryResponse(fn func(*http.Response) bool) TransportOption {
 // and drained before the next attempt otherwise. Once retries end the last
 // response is returned with its body open and a nil error, whatever ended
 // them, so the caller sees the 503 rather than an error the retrier made up.
+//
+// Under [WithHedge] the same replay rule decides whether a request may be
+// hedged at all, and a losing attempt's response is drained and closed
+// whenever it arrives, before or after the winner has been returned. The
+// transport never leaks a body.
 type Transport struct {
 	retrier       *Retrier
 	next          http.RoundTripper
@@ -146,18 +152,13 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !t.replayable(req) {
 		return t.next.RoundTrip(req)
 	}
-	var (
-		attempt int
-		open    *http.Response // a retried response whose body is still on the connection
-	)
-	resp, err := t.retrier.Do(req.Context(), func(ctx context.Context) (*http.Response, error) {
-		attempt++
-		if open != nil {
-			drain(open.Body)
-			open = nil
-		}
+	// Attempts may run concurrently under WithHedge, so the only state they
+	// share is the attempt counter; superseded and losing responses come back
+	// through the discard hook, which is what closes their bodies.
+	var attempt atomic.Int32
+	resp, err := do(t.retrier, req.Context(), func(ctx context.Context) (*http.Response, error) {
 		r := req
-		if attempt > 1 {
+		if attempt.Add(1) > 1 {
 			r = req.Clone(ctx)
 			if req.GetBody != nil {
 				body, err := req.GetBody()
@@ -166,6 +167,8 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 				}
 				r.Body = body
 			}
+		} else if ctx != req.Context() {
+			r = req.Clone(ctx) // a hedged first attempt: its own headers, since a hedge is cloning them concurrently
 		}
 		resp, err := t.next.RoundTrip(r)
 		if err != nil {
@@ -174,10 +177,12 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if !t.retryResponse(resp) {
 			return resp, nil
 		}
-		if !buffer(resp) {
-			open = resp
-		}
+		buffer(resp) // a small body frees the connection before the wait; a large one is drained when superseded
 		return resp, &StatusError{Status: resp.StatusCode, RetryAfter: t.retryAfter(resp)}
+	}, func(resp *http.Response, _ error) {
+		if resp != nil {
+			drain(resp.Body)
+		}
 	})
 	var se *StatusError
 	if errors.As(err, &se) {

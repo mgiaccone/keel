@@ -361,3 +361,109 @@ func TestTransportContextCancelDuringWaitReturnsLastResponse(t *testing.T) {
 		t.Fatalf("stats = %+v", s)
 	}
 }
+
+// TestTransportHedgeClosesTheLosingResponse: the first request stalls, the
+// hedge gets a 503 with a body too large to buffer, then the first answers
+// 200 and wins. The 503 body must be drained and closed by the transport,
+// since the caller never sees it; the winner's body stays open for the
+// caller. With hedging on, a non-replayable POST still passes through once.
+func TestTransportHedgeClosesTheLosingResponse(t *testing.T) {
+	var hits atomic.Int32
+	release := make(chan struct{})
+	stalled := make(chan struct{})
+	gotHedge := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch hits.Add(1) {
+		case 1:
+			close(stalled)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				return
+			}
+			// Far larger than the transport's read buffer: reading it after
+			// RoundTrip returned needs the winner's context still alive.
+			io.WriteString(w, strings.Repeat("y", 1<<20))
+		case 2:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, strings.Repeat("x", _bufferLimit+1))
+			close(gotHedge)
+		default:
+			io.WriteString(w, "post")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	h := newHedged(t, 5*time.Millisecond, true, WithMaxAttempts(2))
+	tracker := &closeTracker{next: srv.Client().Transport}
+	tr, err := NewTransport(h.Retrier, tracker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Transport: tr}
+
+	type result struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := client.Get(srv.URL)
+		done <- result{resp, err}
+	}()
+	<-stalled // the first attempt is the one on the stalled request
+	h.fire(t)
+	<-gotHedge
+	deadline := time.Now().Add(10 * time.Second)
+	for h.Stats().Hedged < 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	// Let the 503 reach the retrier before the winner answers, so it is
+	// superseded rather than drained after the fact; either way it must end
+	// up closed.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request did not return")
+	}
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	body, err := io.ReadAll(r.resp.Body)
+	if err != nil || r.resp.StatusCode != 200 || len(body) != 1<<20 {
+		t.Fatalf("got %d, %d bytes, %v: the winner's body must be readable after Do returned", r.resp.StatusCode, len(body), err)
+	}
+	for time.Now().Before(deadline) {
+		tracker.mu.Lock()
+		closed := append([]bool(nil), tracker.closed...)
+		tracker.mu.Unlock()
+		if len(closed) == 2 && closed[0] && !closed[1] {
+			break
+		}
+		if len(closed) == 2 && closed[1] {
+			t.Fatalf("closed = %v: the winner's body was closed", closed)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	tracker.mu.Lock()
+	closed := append([]bool(nil), tracker.closed...)
+	tracker.mu.Unlock()
+	if len(closed) != 2 || !closed[0] || closed[1] {
+		t.Fatalf("closed = %v, want the losing 503 closed and the winner open", closed)
+	}
+	r.resp.Body.Close()
+	if s := h.Stats(); s.Attempts != 2 || s.Hedged != 1 || s.HedgeWon != 0 || s.Succeeded != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+
+	resp, err := client.Post(srv.URL, "text/plain", strings.NewReader("body")) // replayable: GetBody is set, but POST is not in the method set
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if hits.Load() != 3 || h.Stats().Calls != 1 {
+		t.Fatalf("the POST was hedged: %d hits, %+v", hits.Load(), h.Stats())
+	}
+}

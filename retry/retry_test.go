@@ -48,6 +48,12 @@ type harness struct {
 	mu    sync.Mutex
 	waits []time.Duration
 	deny  atomic.Bool // makes the recorded sleep fail, as a cancelled context would
+
+	// Set by newHedged: a sleep of exactly hedgeAfter is a hedge timer. It is
+	// not recorded as a wait, and when hedgeFire is set it blocks until the
+	// test calls fire, so the test decides when a hedge starts.
+	hedgeAfter time.Duration
+	hedgeFire  chan struct{}
 }
 
 func newHarness(t *testing.T, backoff Backoff, opts ...Option) *harness {
@@ -57,6 +63,17 @@ func newHarness(t *testing.T, backoff Backoff, opts ...Option) *harness {
 		WithClock(h.clock.Now),
 		WithSeed(1, 2),
 		WithSleep(func(ctx context.Context, d time.Duration) error {
+			if h.hedgeAfter > 0 && d == h.hedgeAfter {
+				if h.hedgeFire == nil {
+					return ctx.Err()
+				}
+				select {
+				case <-h.hedgeFire:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			h.mu.Lock()
 			h.waits = append(h.waits, d)
 			h.mu.Unlock()
@@ -72,6 +89,44 @@ func newHarness(t *testing.T, backoff Backoff, opts ...Option) *harness {
 	}
 	h.Retrier = r
 	return h
+}
+
+// newHedged is newHarness on a 10ms constant schedule with WithHedge(after).
+// With manual set, the hedge timer fires only when the test calls fire;
+// otherwise it fires at once, like every other sleep in the harness.
+func newHedged(t *testing.T, after time.Duration, manual bool, opts ...Option) *harness {
+	t.Helper()
+	h := newHarness(t, Constant(10*time.Millisecond), append([]Option{WithHedge(after)}, opts...)...)
+	h.hedgeAfter = after
+	if manual {
+		h.hedgeFire = make(chan struct{})
+	}
+	return h
+}
+
+// fire lets the armed hedge timer go off. It fails the test if no timer is
+// armed within the deadline.
+func (h *harness) fire(t *testing.T) {
+	t.Helper()
+	select {
+	case h.hedgeFire <- struct{}{}:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no hedge timer armed to fire")
+	}
+}
+
+// noTimer asserts that no hedge timer is armed. A timer that was just
+// cancelled may still be in its select, where the probe's send and the
+// cancellation are both ready and Go picks at random, so the probe waits for
+// it to leave first.
+func (h *harness) noTimer(t *testing.T) {
+	t.Helper()
+	time.Sleep(10 * time.Millisecond)
+	select {
+	case h.hedgeFire <- struct{}{}:
+		t.Fatal("a hedge timer is armed")
+	case <-time.After(20 * time.Millisecond):
+	}
 }
 
 func (h *harness) recorded() []time.Duration {
@@ -306,6 +361,8 @@ func TestInvalidOptionsAreAllReported(t *testing.T) {
 		"WithObserver(nil)":      {"x", Constant(0), WithObserver(nil)},
 		"WithClock(nil)":         {"x", Constant(0), WithClock(nil)},
 		"WithSleep(nil)":         {"x", Constant(0), WithSleep(nil)},
+		"WithHedge(0)":           {"x", Constant(0), WithHedge(0)},
+		"WithHedge(-1)":          {"x", Constant(0), WithHedge(-time.Second)},
 		"WithOnRetry(nil) is ok": {"x", Constant(0), WithOnRetry(nil)},
 	}
 	for name, c := range cases {
@@ -395,6 +452,17 @@ func TestStatsString(t *testing.T) {
 	}
 }
 
+func TestStatsStringHedged(t *testing.T) {
+	s := Stats{Name: "x", Backoff: "constant", HedgeAfter: time.Millisecond, Hedged: 3, HedgeWon: 2}
+	if got := s.String(); !strings.HasSuffix(got, " waited=0s hedged=3 hedge_won=2") {
+		t.Fatalf("got %q", got)
+	}
+	s.HedgeAfter = 0
+	if got := s.String(); strings.Contains(got, "hedge") {
+		t.Fatalf("got %q: shows hedging the retrier does not have", got)
+	}
+}
+
 func TestResultString(t *testing.T) {
 	for r, want := range map[Result]string{Success: "success", Exhausted: "exhausted", Aborted: "aborted", Canceled: "canceled", Budget: "budget", Result(9): "Result(9)"} {
 		if got := r.String(); got != want {
@@ -408,6 +476,7 @@ type recorder struct{ events []string }
 
 func (r *recorder) Started()      { r.events = append(r.events, "started") }
 func (r *recorder) Attempt(n int) { r.events = append(r.events, fmt.Sprintf("attempt:%d", n)) }
+func (r *recorder) Hedge(n int)   { r.events = append(r.events, fmt.Sprintf("hedge:%d", n)) }
 func (r *recorder) Wait(n int, d time.Duration) {
 	r.events = append(r.events, fmt.Sprintf("wait:%d/%s", n, d))
 }

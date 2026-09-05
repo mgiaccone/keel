@@ -137,3 +137,32 @@ func ExampleNewTransport() {
 	// 200 ready
 	// POST: 503 after 1 request
 }
+
+// ExampleWithHedge cuts the latency tail: when an attempt has not answered
+// within the hedge delay, another starts, and the first answer wins. The
+// replica behind the first attempt here never answers; the hedge does.
+func ExampleWithHedge() {
+	r, err := retry.New("search",
+		retry.Constant(0), // retries are not the point here, only hedges
+		retry.WithMaxAttempts(2),
+		retry.WithHedge(10*time.Millisecond),
+	)
+	if err != nil {
+		panic(err) // example only
+	}
+
+	var attempts atomic.Int32
+	v, err := r.Do(context.Background(), func(ctx context.Context) (string, error) {
+		if attempts.Add(1) == 1 {
+			<-ctx.Done() // a stuck replica: it answers only once the hedge has won and it is cancelled
+			return "", ctx.Err()
+		}
+		return "results", nil
+	})
+	fmt.Println(v, err)
+	s := r.Stats()
+	fmt.Printf("attempts=%d hedged=%d hedge_won=%d\n", s.Attempts, s.Hedged, s.HedgeWon)
+	// Output:
+	// results <nil>
+	// attempts=2 hedged=1 hedge_won=1
+}

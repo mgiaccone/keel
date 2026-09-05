@@ -1193,7 +1193,7 @@
           "id": 32,
           "type": "timeseries",
           "title": "Calls per second, by result",
-          "description": "Stacked: the total height is demand; exhausted is the user-facing failure, aborted a non-retryable error, budget a retry the budget refused, which during an incident is the budget working.",
+          "description": "Stacked: the total height is demand; exhausted is the user-facing failure, aborted a non-retryable error, budget a retry the budget refused, which during an incident is the budget working. The dashed series is hedges started per second: attempts WithHedge added because the ones in flight were slow. Compare it with go_retry_hedge_wins_total; hedges that do not win are load for nothing.",
           "gridPos": {
             "x": 12,
             "y": 35,
@@ -1213,6 +1213,15 @@
               "expr": "sum by (retrier, result) (rate(go_retry_calls_total{retrier=~\"$retrier\"}[$__rate_interval]))",
               "legendFormat": "{{retrier}} {{result}}",
               "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${DS}"
+              },
+              "expr": "sum by (retrier) (rate(go_retry_hedges_total{retrier=~\"$retrier\"}[$__rate_interval]))",
+              "legendFormat": "{{retrier}} hedges",
+              "refId": "B"
             }
           ],
           "options": {
@@ -1244,7 +1253,26 @@
                 }
               }
             },
-            "overrides": []
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byRegexp",
+                  "options": ".* hedges"
+                },
+                "properties": [
+                  {
+                    "id": "custom.lineStyle",
+                    "value": {
+                      "fill": "dash",
+                      "dash": [
+                        10,
+                        10
+                      ]
+                    }
+                  }
+                ]
+              }
+            ]
           }
         },
         {
