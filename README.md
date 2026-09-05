@@ -52,7 +52,11 @@ mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Ke
 
 Runnable examples with verified output live in each package's `example_test.go`.
 
-## Status and licence
+## Status
 
 `v0`: the API is settling and may still change between minor versions;
-`v1.0.0` will fix it. MIT licence, see `LICENSE`.
+`v1.0.0` will fix it.
+
+## Licence
+
+MIT, see `LICENSE`.
