@@ -68,12 +68,8 @@ client := &http.Client{Transport: transport}
 - [Retrier](docs/retry.md): the bounds that keep retries safe, schedules, the budget, `Retry-After`, the HTTP replay rule, metrics, alerts, dashboard.
 
 Runnable examples with verified output live in each package's `example_test.go`;
-`CONTRIBUTING.md` has the verification commands.
-
-## Status
-
-`v0`: the API is settling and may still change between minor versions;
-`v1.0.0` will fix it.
+`CONTRIBUTING.md` has how to get set up, what help is wanted and the
+conventions the code follows; `make check` runs what CI runs.
 
 ## Licence
 

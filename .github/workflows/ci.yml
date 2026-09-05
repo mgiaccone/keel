@@ -29,21 +29,7 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
-      - name: gofmt
-        run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then echo "unformatted:"; echo "$out"; exit 1; fi
-
-      - name: go mod tidy is a no-op
-        run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
-
-      - name: go vet
-        run: go vet ./...
-
-      - name: tests, race detector, 1/2/4 CPUs
-        run: go test -race -cpu 1,2,4 -count=2 -timeout 15m ./...
-
-      - name: benchmarks compile and run once
-        run: go test -run '^$' -bench . -benchtime=1x ./breaker/ ./ratelimit/ ./retry/
+      # The checks live in the Makefile so that `make check` locally is the
+      # same run as this job. Add a check there, not here.
+      - name: make check
+        run: make check
