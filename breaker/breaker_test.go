@@ -734,6 +734,9 @@ func (r *recorder) Load(inFlight, limit int, ramping bool) {
 	}
 	r.events = append(r.events, e)
 }
+func (r *recorder) Window(rate float64, calls int) {
+	r.events = append(r.events, fmt.Sprintf("window:%.2f(%d)", rate, calls))
+}
 func (r *recorder) Stopped() { r.events = append(r.events, "stopped") }
 
 func TestObserverEventSequence(t *testing.T) {
@@ -829,6 +832,7 @@ func (c *tally) Started()            { c.calls = map[Result]uint64{} }
 func (c *tally) Call(r Result)       { c.calls[r]++ }
 func (c *tally) Stopped()            {}
 func (c *tally) Load(int, int, bool) {}
+func (c *tally) Window(float64, int) {}
 func (c *tally) Transition(_, to State, _ int, _ time.Time) {
 	if to == Open {
 		c.trips++
@@ -1281,9 +1285,12 @@ func TestClockAdvanceRightAfterDo(t *testing.T) {
 // the same rules rather than the code against itself. Jitter is off because
 // the model cannot predict a random draw.
 type refModel struct {
-	failureThreshold, successThreshold, maxProbes, maxInFlight int
+	failureThreshold, successThreshold, maxProbes, maxInFlight int // failureThreshold 0 = consecutive rule off
 	rampStart, rampEnd                                         int // 0 = no ramp
 	openBase, openMax                                          time.Duration
+	rateThreshold                                              float64
+	rateWindow                                                 time.Duration // 0 = rate rule off
+	rateMin, rateBuckets                                       int
 
 	state            State
 	gen              uint64
@@ -1295,8 +1302,51 @@ type refModel struct {
 	ramping          bool
 	openUntil        time.Time
 	consecutiveTrips int
+	outcomes         []windowOutcome // every closed-state outcome since the last close
 
 	calls, rejected, shed, denied, admitted, successes, failures, canceled, trips uint64
+}
+
+// windowOutcome is the model's formulation of the error-rate window: each
+// outcome remembers the bucket slot it landed in, and it is in the window
+// while fewer than rateBuckets slots have passed since. The ring in the
+// breaker must agree with this list at every inspection.
+type windowOutcome struct {
+	slot   int64
+	failed bool
+}
+
+func (m *refModel) slot(now time.Time) int64 {
+	return now.UnixNano() / int64(m.rateWindow/time.Duration(m.rateBuckets))
+}
+
+// window is the calls in the window at now and the share that failed.
+func (m *refModel) window(now time.Time) (calls int, rate float64) {
+	slot := m.slot(now)
+	var fail int
+	for _, o := range m.outcomes {
+		if slot-o.slot < int64(m.rateBuckets) {
+			calls++
+			if o.failed {
+				fail++
+			}
+		}
+	}
+	if calls > 0 {
+		rate = float64(fail) / float64(calls)
+	}
+	return calls, rate
+}
+
+// record enters a closed-state outcome and reports whether the rate rule
+// fires on the window as it then stands.
+func (m *refModel) record(now time.Time, failed bool) bool {
+	if m.rateWindow == 0 {
+		return false
+	}
+	m.outcomes = append(m.outcomes, windowOutcome{slot: m.slot(now), failed: failed})
+	calls, rate := m.window(now)
+	return calls >= m.rateMin && rate >= m.rateThreshold
 }
 
 // deny models a call the admission veto refused after the circuit admitted
@@ -1363,21 +1413,33 @@ func (m *refModel) settle(gen uint64, out outcome, now time.Time) {
 		return
 	}
 	if out == _outcomeFailure {
-		if m.state == HalfOpen || m.consecFail+1 == m.failureThreshold {
+		if m.state == HalfOpen {
 			m.trip(now)
-		} else {
-			m.consecFail++
+			return
+		}
+		rateTrips := m.record(now, true)
+		if m.failureThreshold > 0 && m.consecFail+1 == m.failureThreshold {
+			m.trip(now)
+			return
+		}
+		m.consecFail++
+		if rateTrips {
+			m.trip(now)
 		}
 		return
 	}
 	// success
 	if m.state == Closed {
+		rateTrips := m.record(now, false)
 		m.consecFail = 0
 		if m.ramping {
 			m.limit++
 			if m.limit >= m.rampEnd {
 				m.ramping, m.limit = false, m.maxInFlight
 			}
+		}
+		if rateTrips {
+			m.trip(now)
 		}
 		return
 	}
@@ -1387,6 +1449,7 @@ func (m *refModel) settle(gen uint64, out outcome, now time.Time) {
 		m.gen++
 		m.consecutiveTrips = 0
 		m.consecFail = 0
+		m.outcomes = nil
 		if m.rampStart > 0 {
 			m.ramping, m.limit = true, m.rampStart
 		}
@@ -1419,6 +1482,10 @@ func (m *refModel) stats(now time.Time) Stats {
 	}
 	if m.state == Open {
 		s.NextProbeIn = m.openUntil.Sub(now)
+	}
+	if m.rateWindow > 0 {
+		s.Window = m.rateWindow
+		s.WindowCalls, s.ErrorRate = m.window(now)
 	}
 	return s
 }
@@ -1485,10 +1552,22 @@ func runModel(t *testing.T, seed uint64, steps int) {
 		m.rampEnd = m.rampStart + rng.IntN(ceiling-m.rampStart+1)
 		opts = append(opts, WithRecoveryRamp(m.rampStart, m.rampEnd))
 	}
+	if rng.IntN(2) == 0 {
+		m.rateThreshold = []float64{0.25, 0.5, 0.75, 1}[rng.IntN(4)]
+		m.rateWindow = base * time.Duration(1+rng.IntN(3)) // advances of up to 1.5 × openMax drop from none to all of it
+		m.rateMin = 1 + rng.IntN(4)
+		m.rateBuckets = []int{2, 3, 10}[rng.IntN(3)]
+		opts = append(opts, WithErrorRate(m.rateThreshold, m.rateWindow, m.rateMin), WithErrorRateBuckets(m.rateBuckets))
+		if rng.IntN(4) == 0 {
+			m.failureThreshold = 0 // the rate alone
+			opts = append(opts, WithFailureThreshold(0))
+		}
+	}
 	opts = append(opts, WithAdmission(denyIfMarked))
 	h := newHarness(t, opts...)
-	t.Logf("seed=%d failure=%d success=%d probes=%d inflight=%d ramp=%d..%d base=%s max=%s",
-		seed, m.failureThreshold, m.successThreshold, m.maxProbes, m.maxInFlight, m.rampStart, m.rampEnd, m.openBase, m.openMax)
+	t.Logf("seed=%d failure=%d success=%d probes=%d inflight=%d ramp=%d..%d base=%s max=%s rate=%v/%s/%d buckets=%d",
+		seed, m.failureThreshold, m.successThreshold, m.maxProbes, m.maxInFlight, m.rampStart, m.rampEnd, m.openBase, m.openMax,
+		m.rateThreshold, m.rateWindow, m.rateMin, m.rateBuckets)
 
 	type pending struct {
 		call *inflight
@@ -1590,11 +1669,13 @@ func TestChaosInvariants(t *testing.T) {
 		maxInFlight = 8
 		openMax     = 80 * time.Millisecond
 		jitter      = 0.2
+		window      = 20 * time.Millisecond
 	)
 	var transitions []State // written only by the state goroutine
 	counts := &tally{}
 	h := newHarness(t,
 		WithFailureThreshold(3),
+		WithErrorRate(0.5, window, 4),
 		WithSuccessThreshold(2),
 		WithMaxProbes(maxProbes),
 		WithMaxInFlight(maxInFlight),
@@ -1624,6 +1705,12 @@ func TestChaosInvariants(t *testing.T) {
 		}
 		if uint64(s.ConsecutiveTrips) > s.Trips {
 			t.Errorf("ConsecutiveTrips > Trips: %+v", s)
+		}
+		if s.Window != window || s.ErrorRate < 0 || s.ErrorRate > 1 || (s.WindowCalls == 0 && s.ErrorRate != 0) {
+			t.Errorf("error-rate window inconsistent: %+v", s)
+		}
+		if uint64(s.WindowCalls) > s.Successes+s.Failures {
+			t.Errorf("WindowCalls exceeds settled outcomes: %+v", s)
 		}
 		if s.Calls < prev.Calls || s.Admitted < prev.Admitted || s.Rejected < prev.Rejected || s.Shed < prev.Shed ||
 			s.Successes < prev.Successes || s.Failures < prev.Failures || s.Canceled < prev.Canceled || s.Trips < prev.Trips {
@@ -1768,6 +1855,22 @@ func BenchmarkDoClosed(b *testing.B) {
 	}
 }
 
+// BenchmarkDoClosedErrorRate is BenchmarkDoClosed with WithErrorRate set;
+// the difference is one clock read and the ring update per settle.
+func BenchmarkDoClosedErrorRate(b *testing.B) {
+	b.ReportAllocs()
+	br, err := New("bench", WithErrorRate(0.5, time.Second, 100))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer br.Stop()
+	ctx := context.Background()
+	for b.Loop() {
+		v, _ := br.Do(ctx, work)
+		_sink += v
+	}
+}
+
 // BenchmarkDoClosedTimeout is BenchmarkDoClosed with WithTimeout set; the
 // difference is the cost of deriving a deadline context per call.
 func BenchmarkDoClosedTimeout(b *testing.B) {
@@ -1829,5 +1932,292 @@ func BenchmarkStats(b *testing.B) {
 	defer br.Stop()
 	for b.Loop() {
 		_sink += int(br.Stats().Calls)
+	}
+}
+
+// blocked starts a call whose fn blocks until finish is sent an outcome, and
+// returns once the breaker has admitted it.
+func blocked(t *testing.T, h *harness) *inflight {
+	t.Helper()
+	c := &inflight{finish: make(chan outcome), done: make(chan error, 1)}
+	entered := make(chan struct{})
+	go func() {
+		_, err := h.Do(context.Background(), func(context.Context) (int, error) {
+			close(entered)
+			return 0, outcomeErr(<-c.finish)
+		})
+		c.done <- err
+	}()
+	select {
+	case <-entered:
+	case err := <-c.done:
+		t.Fatalf("call was not admitted: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("call neither admitted nor rejected")
+	}
+	return c
+}
+
+func TestErrorRateValidation(t *testing.T) {
+	bad := []struct {
+		name string
+		opts []Option
+	}{
+		{"threshold 0", []Option{WithErrorRate(0, time.Second, 1)}},
+		{"threshold above 1", []Option{WithErrorRate(1.5, time.Second, 1)}},
+		{"threshold NaN", []Option{WithErrorRate(math.NaN(), time.Second, 1)}},
+		{"window 0", []Option{WithErrorRate(0.5, 0, 1)}},
+		{"window negative", []Option{WithErrorRate(0.5, -time.Second, 1)}},
+		{"minCalls 0", []Option{WithErrorRate(0.5, time.Second, 0)}},
+		{"buckets 1", []Option{WithErrorRate(0.5, time.Second, 1), WithErrorRateBuckets(1)}},
+		{"buckets without rate", []Option{WithErrorRateBuckets(10)}},
+		{"zero-width bucket", []Option{WithErrorRate(0.5, 5, 1), WithErrorRateBuckets(10)}},
+		{"failure threshold 0 without rate", []Option{WithFailureThreshold(0)}},
+		{"failure threshold negative", []Option{WithFailureThreshold(-1)}},
+	}
+	for _, tc := range bad {
+		b, err := New(t.Name(), tc.opts...)
+		if !errors.Is(err, ErrInvalidOption) || b != nil {
+			t.Errorf("%s: New = %v, %v; want nil, ErrInvalidOption", tc.name, b, err)
+		}
+	}
+	// Every problem is reported at once.
+	_, err := New(t.Name(), WithErrorRate(0, 0, 0), WithErrorRateBuckets(2), WithFailureThreshold(0))
+	for _, want := range []string{"WithErrorRate(0, 0s, 0)", "WithErrorRateBuckets requires WithErrorRate", "WithFailureThreshold(0) requires WithErrorRate"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	good := [][]Option{
+		{WithErrorRate(1, time.Millisecond, 1)},
+		{WithErrorRate(0.5, 10, 1)}, // ten buckets of one nanosecond
+		{WithErrorRate(0.3, time.Second, 5), WithErrorRateBuckets(1000)},
+		{WithErrorRate(0.5, time.Second, 1), WithFailureThreshold(0)},
+		{WithErrorRateBuckets(2), WithErrorRate(0.5, time.Second, 1)}, // order does not matter
+	}
+	for i, opts := range good {
+		b, err := New(t.Name(), opts...)
+		if err != nil {
+			t.Errorf("good[%d]: %v", i, err)
+			continue
+		}
+		b.Stop()
+	}
+}
+
+func TestErrorRateTripsPastMinCalls(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, time.Second, 4))
+	h.fail(t)
+	h.ok(t)
+	h.fail(t)
+	h.wantState(t, Closed) // 2/3 failed, but only 3 calls
+	if s := h.Stats(); s.Window != time.Second || s.WindowCalls != 3 || s.ErrorRate != 2.0/3.0 {
+		t.Fatalf("stats = %+v", s)
+	}
+	h.fail(t)
+	h.wantState(t, Open)
+	if s := h.Stats(); s.Trips != 1 || s.WindowCalls != 4 || s.ErrorRate != 0.75 {
+		t.Fatalf("stats = %+v", s)
+	}
+
+	// One call under minCalls never trips, whatever the rate.
+	h = newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, time.Second, 2))
+	h.fail(t)
+	h.wantState(t, Closed)
+	if s := h.Stats(); s.WindowCalls != 1 || s.ErrorRate != 1 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+// TestErrorRateRotation: outcomes leave the window bucket by bucket as the
+// clock advances, without any traffic. The fake clock starts on a bucket
+// boundary, so the arithmetic below is exact.
+func TestErrorRateRotation(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, 100*time.Millisecond, 100))
+	for range 5 {
+		h.fail(t)
+	}
+	h.clock.Add(30 * time.Millisecond)
+	for range 5 {
+		h.ok(t)
+	}
+	if s := h.Stats(); s.WindowCalls != 10 || s.ErrorRate != 0.5 {
+		t.Fatalf("after 5 fails and 5 oks: %+v", s)
+	}
+	h.clock.Add(60 * time.Millisecond) // 9 buckets after the failures: still in
+	if s := h.Stats(); s.WindowCalls != 10 || s.ErrorRate != 0.5 {
+		t.Fatalf("at 90ms: %+v", s)
+	}
+	h.clock.Add(10 * time.Millisecond) // 10 buckets after the failures: gone
+	if s := h.Stats(); s.WindowCalls != 5 || s.ErrorRate != 0 {
+		t.Fatalf("at 100ms: %+v", s)
+	}
+	h.clock.Add(30 * time.Millisecond) // 10 buckets after the successes
+	if s := h.Stats(); s.WindowCalls != 0 || s.ErrorRate != 0 {
+		t.Fatalf("at 130ms: %+v", s)
+	}
+	h.fail(t) // the ring is usable after emptying
+	if s := h.Stats(); s.WindowCalls != 1 || s.ErrorRate != 1 {
+		t.Fatalf("after a fresh failure: %+v", s)
+	}
+}
+
+func TestErrorRateGapClearsWindow(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, time.Second, 100), WithErrorRateBuckets(3))
+	h.fail(t)
+	h.ok(t)
+	h.clock.Add(2 * time.Second)
+	if s := h.Stats(); s.WindowCalls != 0 || s.ErrorRate != 0 {
+		t.Fatalf("after a gap of two windows: %+v", s)
+	}
+	h.fail(t)
+	if s := h.Stats(); s.WindowCalls != 1 || s.ErrorRate != 1 {
+		t.Fatalf("after a fresh failure: %+v", s)
+	}
+}
+
+func TestBothRulesCoexist(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(5), WithErrorRate(0.5, time.Second, 10))
+	// Five in a row trip below minCalls.
+	for range 5 {
+		h.fail(t)
+	}
+	h.wantState(t, Open)
+	if s := h.Stats(); s.WindowCalls != 5 || s.ErrorRate != 1 {
+		t.Fatalf("after the consecutive trip: %+v", s)
+	}
+	h.clock.Add(time.Second)
+	h.ok(t)
+	h.ok(t)
+	h.wantState(t, Closed)
+	// Half the calls failing trips without five in a row.
+	for i := range 10 {
+		if i%2 == 0 {
+			h.fail(t)
+		} else {
+			h.ok(t)
+		}
+		if i < 9 {
+			h.wantState(t, Closed)
+		}
+	}
+	h.wantState(t, Open)
+	if s := h.Stats(); s.Trips != 2 || s.ConsecutiveTrips != 1 || s.WindowCalls != 10 || s.ErrorRate != 0.5 {
+		t.Fatalf("after the rate trip: %+v", s)
+	}
+}
+
+func TestFailureThresholdZeroDisablesConsecutive(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(0), WithErrorRate(0.5, time.Second, 100))
+	for range 50 {
+		h.fail(t)
+	}
+	h.wantState(t, Closed)
+	if s := h.Stats(); s.Failures != 50 || s.WindowCalls != 50 || s.ErrorRate != 1 || s.Trips != 0 {
+		t.Fatalf("stats = %+v", s)
+	}
+}
+
+func TestErrorRateIgnoresCancelledAndStale(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(2), WithErrorRate(0.5, time.Second, 10))
+	h.Do(t.Context(), func(context.Context) (int, error) { return 0, context.Canceled })
+	if s := h.Stats(); s.Canceled != 1 || s.WindowCalls != 0 {
+		t.Fatalf("after a cancellation: %+v", s)
+	}
+	stale := blocked(t, h) // admitted while closed, settles after the next close
+	h.fail(t)
+	h.fail(t)
+	h.wantState(t, Open)
+	h.clock.Add(time.Second)
+	h.ok(t)
+	h.ok(t)
+	h.wantState(t, Closed)
+	stale.finish <- _outcomeFailure
+	recv(t, stale.done)
+	if s := h.Stats(); s.Failures != 3 || s.WindowCalls != 0 || s.State != Closed {
+		t.Fatalf("after the stale failure: %+v", s)
+	}
+}
+
+func TestErrorRateClearsOnClose(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, time.Second, 4))
+	for range 4 {
+		h.fail(t)
+	}
+	h.wantState(t, Open)
+	h.clock.Add(time.Second)
+	h.ok(t)
+	h.ok(t) // probes: not in the window
+	h.wantState(t, Closed)
+	if s := h.Stats(); s.WindowCalls != 0 || s.ErrorRate != 0 {
+		t.Fatalf("after the close: %+v", s)
+	}
+	for range 3 {
+		h.fail(t)
+	}
+	h.wantState(t, Closed) // minCalls must be reached again
+	h.fail(t)
+	h.wantState(t, Open)
+}
+
+func TestErrorRateDecaysWithoutTraffic(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, 100*time.Millisecond, 100))
+	for range 4 {
+		h.fail(t)
+		h.ok(t)
+	}
+	if s := h.Stats(); s.WindowCalls != 8 || s.ErrorRate != 0.5 {
+		t.Fatalf("stats = %+v", s)
+	}
+	h.clock.Add(50 * time.Millisecond)
+	if s := h.Stats(); s.WindowCalls != 8 || s.ErrorRate != 0.5 {
+		t.Fatalf("half a window later: %+v", s)
+	}
+	h.clock.Add(50 * time.Millisecond)
+	if s := h.Stats(); s.WindowCalls != 0 || s.ErrorRate != 0 {
+		t.Fatalf("a window later: %+v", s)
+	}
+}
+
+func TestStatsStringErrorRate(t *testing.T) {
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, time.Second, 100))
+	h.fail(t)
+	h.fail(t)
+	h.ok(t)
+	h.ok(t)
+	if line := h.Stats().String(); !strings.Contains(line, " in_flight=0 error_rate=0.50(4)") {
+		t.Fatalf("line = %q", line)
+	}
+	if line := newHarness(t).Stats().String(); strings.Contains(line, "error_rate") {
+		t.Fatalf("line = %q shows a window the breaker does not have", line)
+	}
+}
+
+func TestObserverWindowEvents(t *testing.T) {
+	rec := &recorder{}
+	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, time.Second, 3), WithObserver(rec))
+	h.fail(t)
+	h.ok(t)
+	h.fail(t) // trips on the third call
+	h.wantState(t, Open)
+	h.clock.Add(time.Second)
+	h.ok(t)
+	h.ok(t)
+	h.wantState(t, Closed)
+	h.Stop()
+	var got []string
+	for _, e := range rec.events {
+		if strings.HasPrefix(e, "window:") {
+			got = append(got, e)
+		}
+	}
+	want := []string{"window:1.00(1)", "window:0.50(2)", "window:0.67(3)", "window:0.00(0)"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("window events = %q, want %q", got, want)
+	}
+	// The clear is reported after the transition it belongs to.
+	i := slices.Index(rec.events, "half-open->closed trips=0 open_until_zero=true")
+	if i < 0 || rec.events[i+1] != "window:0.00(0)" {
+		t.Fatalf("events around the close: %q", rec.events)
 	}
 }

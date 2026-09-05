@@ -306,3 +306,36 @@ func ExampleRegister() {
 	// go_breaker_state{dependency="reporting-db",state="half-open"} 0
 	// go_breaker_state{dependency="reporting-db",state="open"} 1
 }
+
+// ExampleWithErrorRate guards a high-volume path by error rate. Scattered
+// failures are normal there and a run of five means nothing, so the
+// consecutive rule is off, and the circuit opens once at least ten of the
+// last ten seconds' calls have settled and a third or more of them failed.
+func ExampleWithErrorRate() {
+	b, err := breaker.New("search",
+		breaker.WithErrorRate(0.3, 10*time.Second, 10),
+		breaker.WithFailureThreshold(0),
+	)
+	if err != nil {
+		panic(err) // example only
+	}
+	defer b.Stop()
+
+	errDown := errors.New("search: 503 Service Unavailable")
+	refused := 0
+	for i := range 20 {
+		_, err := b.Do(context.Background(), func(context.Context) (string, error) {
+			if i%3 == 0 { // every third call fails
+				return "", errDown
+			}
+			return "results", nil
+		})
+		if errors.Is(err, breaker.ErrOpen) {
+			refused++
+		}
+	}
+	s := b.Stats()
+	fmt.Printf("state=%s window=%d calls, %.0f%% failed; %d calls refused\n", s.State, s.WindowCalls, 100*s.ErrorRate, refused)
+	// Output:
+	// state=open window=10 calls, 40% failed; 10 calls refused
+}

@@ -1,8 +1,9 @@
 # Circuit Breaker
 
 Package `github.com/mgiaccone/keel/breaker`. A circuit breaker for a single
-dependency, with a concurrency limit (bulkhead), a per-call timeout, a
-recovery ramp and a pluggable admission veto.
+dependency, tripped by consecutive failures or by an error rate over a
+window, with a concurrency limit (bulkhead), a per-call timeout, a recovery
+ramp and a pluggable admission veto.
 
 ## Quick start
 
@@ -34,17 +35,24 @@ cache and falls back to a database through a breaker, with verified output.
 
 ## When to use it
 
-A breaker counts consecutive failures and, past a threshold, refuses every
-call until a probe succeeds. This suits a path where a few consecutive
-failures mean the dependency is down, which is true when call volume is low
-and errors are otherwise rare: a fallback taken only on a cache miss, a call
-made only on a slow path, a dependency with a small number of callers.
+A breaker refuses every call to a dependency that has shown itself down,
+until a probe succeeds. Two rules decide "down", and the circuit opens when
+either fires.
 
-It does not suit a high-volume path where scattered errors are normal. There,
-a run of five failures is a coincidence rather than an outage, and the
-circuit would open on healthy traffic. Adaptive concurrency limits or
-error-rate windows are the tools for that case; this package does not
-implement them.
+Consecutive failures suit a path where call volume is low and errors are
+otherwise rare: a fallback taken only on a cache miss, a call made only on a
+slow path, a dependency with a small number of callers. There a run of five
+failures means the dependency is down.
+
+On a high-volume path where scattered errors are normal, a run of five is a
+coincidence rather than an outage, and a real 30% error rate rarely produces
+five in a row. `WithErrorRate` trips on the share of calls that failed over a
+trailing window, once enough calls have been seen for the share to mean
+something; the consecutive rule is then set high, or switched off with
+`WithFailureThreshold(0)`.
+
+Bounding the requests a service itself accepts, by an adaptive concurrency
+limit with load shedding, is inbound admission and outside this package.
 
 The breaker's bulkhead addresses a different failure: a dependency that is
 slow but not failing. Slow calls never trip the circuit, but each one holds a
@@ -61,12 +69,45 @@ Bounding how many calls *start* per second is rate limiting, which is the
 
 | State | Calls are | Leaves when |
 |---|---|---|
-| closed | admitted; consecutive failures counted | `FailureThreshold` consecutive failures → open |
+| closed | admitted; outcomes counted | `FailureThreshold` consecutive failures, or the error-rate rule → open |
 | open | refused with `ErrOpen` | the open interval has elapsed → half-open |
 | half-open | admitted up to `MaxProbes` at a time; further calls refused with `ErrProbeLimit` | `SuccessThreshold` consecutive successes → closed; one failure → open |
 
 A success while closed resets the failure count. A failure while half-open
 reopens the circuit regardless of how many successes preceded it.
+
+### The error-rate window
+
+`WithErrorRate(threshold, window, minCalls)` adds the second trip rule. Every
+call settled while closed, except a cancellation, enters a ring of
+`WithErrorRateBuckets` buckets (default 10) that together span `window`; each
+bucket counts the successes and failures that landed in it. After each
+outcome, if the ring holds at least `minCalls` calls and the share that
+failed is at least `threshold`, the circuit opens. The consecutive rule is
+checked first on the same outcome; either opens the circuit.
+
+The ring is rotated lazily. Buckets are aligned to multiples of
+`window/buckets` on the clock. When an outcome or a `Stats` call arrives, the
+buckets that have left the window are zeroed, and a gap of a whole window
+empties the ring; nothing runs between calls. An outcome therefore leaves
+the window together with its bucket, between `window − window/buckets` and
+`window` after it was recorded, and the rate in `Stats` decays to zero on an
+idle breaker as inspections roll the outcomes out.
+
+Only closed-state outcomes enter the window: half-open keeps its probe rules,
+and a stale outcome (see Generations) is counted in the totals but not in the
+window. The ring is cleared when the circuit closes, so a recovery starts
+with no history and a second trip needs `minCalls` fresh calls. While open or
+half-open the ring keeps what it had, decaying, which is what
+`Stats.ErrorRate` shows during an outage.
+
+Worked example: `WithErrorRate(0.5, 10*time.Second, 20)` with the default ten
+buckets, so each bucket spans one second. At 5 calls per second the window
+holds about 50 calls; the circuit opens once 20 or more of the last ten
+seconds' calls have settled and half of them failed, and 3 failures among 47
+successes move the rate to 0.06 and nothing else. At 1 call per second the
+window never reaches 20 calls and the rule never fires; the consecutive rule
+is what protects that path.
 
 ### The open interval
 
@@ -151,7 +192,9 @@ wrapping `ErrInvalidOption` that lists every such option.
 
 | Option | Default | Effect |
 |---|---|---|
-| `WithFailureThreshold(n)` | 5 | Consecutive failures while closed that open the circuit. |
+| `WithFailureThreshold(n)` | 5 | Consecutive failures while closed that open the circuit; 0 switches the rule off, with `WithErrorRate` set. |
+| `WithErrorRate(threshold, window, minCalls)` | off | Opens the circuit when at least `minCalls` calls settled while closed in the trailing `window` and a share of `threshold` or more failed. |
+| `WithErrorRateBuckets(n)` | 10 | Buckets the window is split into; the rate moves in steps of `window/n`. |
 | `WithSuccessThreshold(n)` | 2 | Consecutive successful probes while half-open that close it. |
 | `WithMaxProbes(n)` | 1 | Probes in flight at once while half-open. |
 | `WithOpenInterval(base, max)` | 5s, 60s | First open interval and its cap. |
@@ -194,6 +237,34 @@ is still failing restores full traffic; the traffic fails, the circuit
 reopens with a doubled interval, and the sequence repeats. Requiring two
 consecutive successes prevents that oscillation at the cost of one extra
 probe per recovery.
+
+### `WithErrorRate`
+
+Off by default; "The error-rate window" above has the mechanics. `threshold`
+is in (0, 1], `window` is positive, `minCalls` is at least 1, and `New`
+rejects a window too short to give each bucket a nanosecond. Nothing else is
+rejected: a short window with a low `minCalls` can be meant, in a test.
+
+Sizing:
+
+- `window`: about ten times the p99 latency of the call, so one slow burst
+  cannot fill the window on its own and the rate reflects many independent
+  calls.
+- `minCalls`: about the calls one window sees at the lowest traffic you still
+  want the rule to protect. Below it the rule is silent, which is the point:
+  two failures out of three at night are not an outage.
+- `threshold`: 0.3 to 0.5 for a dependency whose scattered errors are normal,
+  higher only if `IsFailure` is already strict. At 1 the rule fires only when
+  every call in the window failed.
+- `WithErrorRateBuckets`: rarely worth changing. With 10 buckets the rate
+  moves in tenths of the window, finer than the open interval that follows a
+  trip. More buckets suit a window that is long relative to how quickly the
+  rate should fall after a burst of failures.
+
+`WithFailureThreshold(0)` switches the consecutive rule off for a path that
+should trip only on the rate; it is an error without `WithErrorRate`.
+`ExampleWithErrorRate` in `breaker/example_test.go` shows a path tripping on
+a 40% rate with the consecutive rule off.
 
 ### Bulkhead
 
@@ -287,8 +358,8 @@ Every call that reaches the breaker ends in exactly one result:
 
 | Result | `fn` ran | Effect on the circuit |
 |---|---|---|
-| success | yes | resets the failure run; counts toward closing while half-open |
-| failure | yes | extends the failure run; reopens while half-open |
+| success | yes | resets the failure run and enters the error-rate window; counts toward closing while half-open |
+| failure | yes | extends the failure run and enters the error-rate window; reopens while half-open |
 | canceled | yes | none |
 | rejected | no | none (`ErrOpen`, `ErrProbeLimit`) |
 | shed | no | none (`ErrBulkhead`) |
@@ -298,32 +369,38 @@ Every call that reaches the breaker ends in exactly one result:
 
 `Stats` returns a snapshot with the state, `ConsecutiveTrips`, `NextProbeIn`
 (zero unless open), `InFlight`, `InFlightLimit` (0 when unlimited),
-`Ramping`, and the cumulative counters `Calls`, `Rejected`, `Shed`, `Denied`,
-`Admitted`, `Successes`, `Failures`, `Canceled` and `Trips`. Two identities
-hold at every observation:
+`Ramping`, the error-rate window as `Window` (0 when the rule is off),
+`WindowCalls` and `ErrorRate`, and the cumulative counters `Calls`,
+`Rejected`, `Shed`, `Denied`, `Admitted`, `Successes`, `Failures`, `Canceled`
+and `Trips`. Three identities hold at every observation:
 
 ```
 Admitted + Rejected + Shed + Denied + InFlight == Calls
 Successes + Failures + Canceled == Admitted
+WindowCalls <= Successes + Failures
 ```
 
 `Admitted` counts calls whose `fn` has returned; a running call is in
-`InFlight`. Every cumulative counter is monotonic.
+`InFlight`. Every cumulative counter is monotonic. `WindowCalls` and
+`ErrorRate` are computed against the clock at inspection, so they fall on an
+idle breaker as the window rolls.
 
 `Stats.String` renders one line:
 
 ```
-breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 denied=0 ok=760 fail=9 canceled=0 in_flight=3/64 next_probe_in=23s
+breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 denied=0 ok=760 fail=9 canceled=0 in_flight=3/64 error_rate=0.12(120) next_probe_in=23s
 ```
 
 The cap after the slash appears only when one is set, `(ramping)` follows it
-during a ramp, and `next_probe_in` appears only while open.
+during a ramp, `error_rate` with `WindowCalls` in parentheses appears only
+under `WithErrorRate`, and `next_probe_in` appears only while open.
 
 ### Guarantees
 
 - When `Do` returns, the outcome has been applied.
 - A stale outcome is counted but never drives the state machine.
-- Open → half-open is evaluated lazily; no goroutine wakes for an idle breaker.
+- Open → half-open is evaluated lazily, and so is the error-rate window; no
+  goroutine wakes for an idle breaker.
 - `Do` allocates nothing on the admitted or refused paths (a per-call channel
   is recycled through a free list). `WithTimeout` adds the allocations of
   `context.WithTimeout`.
@@ -366,9 +443,15 @@ cannot do itself. See [`retry`](retry.md).
 
 `WithObserver` attaches an `Observer` that receives `Started`, `Call(Result)`,
 `Transition(from, to, consecutiveTrips, openUntil)`, `Load(inFlight, limit,
-ramping)` and `Stopped`, in order, on the state goroutine. The Prometheus
-metrics are one implementation of this interface. Observers must return
-promptly and must not call back into the breaker.
+ramping)`, `Window(rate, calls)` and `Stopped`, in order, on the state
+goroutine. The Prometheus metrics are one implementation of this interface.
+Observers must return promptly and must not call back into the breaker.
+
+`Window` was added in v0.4.0 with `WithErrorRate`; an observer written
+before it needs the method, an empty one if the window is of no interest. It
+is delivered whenever the window changes: after an outcome enters it, after
+an inspection rolls outcomes out of it, and as `(0, 0)` when a close clears
+it. Without `WithErrorRate` it is never delivered.
 
 ## Observability
 
@@ -388,6 +471,8 @@ its name as the `dependency` label. A breaker's series exist from the moment
 | `go_breaker_in_flight` | gauge | `dependency` |
 | `go_breaker_in_flight_limit` | gauge, +Inf when unlimited | `dependency` |
 | `go_breaker_ramping` | gauge, 0 or 1 | `dependency` |
+| `go_breaker_error_rate` | gauge, 0 to 1; 0 when the rule is off | `dependency` |
+| `go_breaker_window_calls` | gauge | `dependency` |
 | `go_breaker_calls_total` | counter | `dependency`, `result` ∈ success, failure, canceled, rejected, shed, denied |
 | `go_breaker_trips_total` | counter | `dependency` |
 
@@ -406,8 +491,14 @@ Common queries:
 go_breaker_state{state="open"} == 1                         # open now
 rate(go_breaker_calls_total{result=~"rejected|shed"}[5m])   # calls refused per second
 go_breaker_in_flight / go_breaker_in_flight_limit           # bulkhead utilisation
+go_breaker_error_rate > 0.3                                 # the window's failed share, per instance
 increase(go_breaker_trips_total[10m])                       # trips in the last ten minutes
 ```
+
+The window gauges follow `Stats`: they are updated when an outcome enters the
+window and when an inspection rolls outcomes out, so on an idle instance they
+hold their last value until something reads `Stats`, the way the state gauge
+holds `open` past its deadline.
 
 ### Alerting
 
@@ -433,9 +524,10 @@ failures. `BreakerMetricsAbsent` catches a missing `Register` call or a
 breaker that was never created, both of which otherwise look like a healthy
 dependency.
 
-`go_breaker_consecutive_trips` and `go_breaker_open_until_timestamp_seconds`
-are for dashboards rather than alerts; a negative countdown is the lazy
-transition, not a fault.
+`go_breaker_consecutive_trips`, `go_breaker_open_until_timestamp_seconds`
+and `go_breaker_error_rate` are for dashboards rather than alerts; a negative
+countdown is the lazy transition, not a fault, and a trip by the rate rule is
+a trip like any other, which `BreakerOpenFleetWide` covers.
 
 A CPU-throttled container hits its own timeouts, and `DeadlineExceeded` is a
 failure, so the circuit opens because of the container rather than the
@@ -452,6 +544,9 @@ current state, how many times it has tripped, and when the next probe is due.
 metrics, provided as a starting point. The state gauge is best shown as a
 state timeline after collapsing the one-hot series into one ordinal:
 `go_breaker_state{state="half-open"} * 1 + go_breaker_state{state="open"} * 2`.
+The "Error rate" panel plots the worst instance's `go_breaker_error_rate`
+per dependency; a flat zero is a healthy window or a breaker without the
+rule.
 
 ## Testing
 
@@ -460,8 +555,11 @@ Beyond one test per documented property, the suite has three layers:
 - **A reference model.** `TestModel` drives the breaker and an independent
   single-threaded implementation of the documented rules through the same
   random sequences of admissions, out-of-order settles, admission vetoes and
-  clock advances, comparing `Stats` after every step. A divergence prints the
-  seed.
+  clock advances, comparing `Stats` after every step. Half the seeds enable
+  the error-rate rule; the model keeps a list of outcomes with their bucket
+  slots where the breaker keeps a ring, so the two formulations must agree
+  on `WindowCalls` and `ErrorRate` at every inspection. A divergence prints
+  the seed.
 - **Chaos with invariants.** `TestChaosInvariants` runs many goroutines with
   random outcomes, cancellations, vetoes, clock advances and inspections,
   checks the `Stats` identities and counter monotonicity at every observation,
@@ -484,13 +582,15 @@ the test code is the fake clock's atomic.
 |---|---:|---:|---:|
 | baseline, `fn` called directly | 1.6 | 0 | 0 |
 | `Do`, closed, serial, metrics fed | 1004 | 0 | 0 |
+| `Do`, closed, serial, `WithErrorRate` set | 1077 | 0 | 0 |
 | `Do`, closed, serial, `WithTimeout` set | 1287 | 272 | 4 |
 | `Do`, open (refused) | 446 | 0 | 0 |
 | `Do`, closed, 18 goroutines | 3608 | 0 | 0 |
-| `Stats` | 550 | 256 | 2 |
+| `Stats` | 555 | 272 | 2 |
 
 A `Do` on the admitted path costs two channel round trips, one for admission
-and one for the acknowledged settle; the refused path costs one. Channel
+and one for the acknowledged settle; the refused path costs one. The
+error-rate rule adds a clock read and a ring update per settle. Channel
 handoff time is dominated by scheduler wakeups and is roughly double on a
 single core. The parallel figure is per call across all goroutines: a single
 state goroutine serialises every admission, so contention appears as latency.

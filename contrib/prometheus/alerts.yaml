@@ -17,6 +17,8 @@ groups:
   # The dependency is down: most instances agree. Page.
   # The `for` matters: the first open interval is 5s by default, and a
   # single trip that recovers on its first probe must not page anyone.
+  # A trip by WithErrorRate lands here like any other; go_breaker_error_rate
+  # itself is for dashboards, not for alerting.
   - alert: BreakerOpenFleetWide
     expr: breaker:open_fraction > 0.5
     for: 2m

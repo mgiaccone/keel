@@ -28,6 +28,8 @@ const (
 //	go_breaker_in_flight{dependency}                                 gauge
 //	go_breaker_in_flight_limit{dependency}                           gauge, +Inf when unlimited
 //	go_breaker_ramping{dependency}                                   gauge, 1 during a recovery ramp
+//	go_breaker_error_rate{dependency}                                gauge, 0 when WithErrorRate is off
+//	go_breaker_window_calls{dependency}                              gauge, calls in the error-rate window
 //	go_breaker_calls_total{dependency,result="success|failure|canceled|rejected|shed|denied"}  counter
 //	go_breaker_trips_total{dependency}                               counter
 var (
@@ -55,6 +57,14 @@ var (
 		Subsystem: _subsystem, Name: "ramping",
 		Help: "1 while a recovery ramp is in progress: the circuit just closed and the in-flight cap is still climbing.",
 	}, []string{"dependency"})
+	_errorRateGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: _subsystem, Name: "error_rate",
+		Help: "Share of calls settled while closed that failed, over the trailing WithErrorRate window; 0 when the rule is off or the window is empty.",
+	}, []string{"dependency"})
+	_windowCallsGauge = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Subsystem: _subsystem, Name: "window_calls",
+		Help: "Calls settled while closed in the trailing WithErrorRate window; 0 when the rule is off.",
+	}, []string{"dependency"})
 	_callsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: _subsystem, Name: "calls_total",
 		Help: "Calls that reached the breaker, by result. success+failure+canceled ran; rejected, shed and denied did not.",
@@ -65,7 +75,8 @@ var (
 	}, []string{"dependency"})
 
 	_collectors = []prometheus.Collector{
-		_stateGauge, _openUntilGauge, _consecutiveTripsGauge, _inFlightGauge, _inFlightLimitGauge, _rampingGauge, _callsCounter, _tripsCounter,
+		_stateGauge, _openUntilGauge, _consecutiveTripsGauge, _inFlightGauge, _inFlightLimitGauge, _rampingGauge,
+		_errorRateGauge, _windowCallsGauge, _callsCounter, _tripsCounter,
 	}
 
 	_allStates  = [...]State{Closed, Open, HalfOpen}
@@ -154,6 +165,8 @@ type metricsObserver struct {
 	inFlight         prometheus.Gauge
 	inFlightLimit    prometheus.Gauge
 	ramping          prometheus.Gauge
+	errorRate        prometheus.Gauge
+	windowCalls      prometheus.Gauge
 	trips            prometheus.Counter
 }
 
@@ -172,6 +185,8 @@ func (o *metricsObserver) Started() {
 	o.inFlight = _inFlightGauge.WithLabelValues(o.dep)
 	o.inFlightLimit = _inFlightLimitGauge.WithLabelValues(o.dep)
 	o.ramping = _rampingGauge.WithLabelValues(o.dep)
+	o.errorRate = _errorRateGauge.WithLabelValues(o.dep)
+	o.windowCalls = _windowCallsGauge.WithLabelValues(o.dep)
 	o.trips = _tripsCounter.WithLabelValues(o.dep)
 
 	o.setState(Closed)
@@ -180,6 +195,8 @@ func (o *metricsObserver) Started() {
 	o.inFlight.Set(0)
 	o.inFlightLimit.Set(math.Inf(1)) // Load follows immediately if a cap is set
 	o.ramping.Set(0)
+	o.errorRate.Set(0)
+	o.windowCalls.Set(0)
 	o.trips.Add(0)
 }
 
@@ -208,6 +225,11 @@ func (o *metricsObserver) Load(inFlight, limit int, ramping bool) {
 		r = 1
 	}
 	o.ramping.Set(r)
+}
+
+func (o *metricsObserver) Window(rate float64, calls int) {
+	o.errorRate.Set(rate)
+	o.windowCalls.Set(float64(calls))
 }
 
 // Stopped removes the breaker's series.

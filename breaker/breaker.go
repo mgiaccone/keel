@@ -2,9 +2,10 @@
 // owned by a single goroutine and reached only through channels: the core has
 // no mutexes, no atomics and no timers.
 //
-// The breaker counts consecutive failures, which suits low-volume guarded
-// paths such as a fallback that runs only on a cache miss. On a high-volume
-// path, where scattered errors are normal, use adaptive throttling instead.
+// Two rules trip the circuit: a run of consecutive failures, which suits a
+// low-volume path such as a fallback that runs only on a cache miss, and an
+// error rate over a trailing window ([WithErrorRate]), for a high-volume path
+// where scattered errors are normal.
 //
 // Time-based transitions (open → half-open) are evaluated lazily against an
 // injectable clock when a call or an inspection arrives, never by a timer.
@@ -108,9 +109,11 @@ type config struct {
 	openMax          time.Duration
 	openJitter       float64
 	timeout          time.Duration
-	maxInFlight      int   // static bulkhead; 0 = unlimited
-	aimd             *aimd // adaptive bulkhead; nil = off
-	ramp             *ramp // recovery ramp; nil = off
+	maxInFlight      int        // static bulkhead; 0 = unlimited
+	aimd             *aimd      // adaptive bulkhead; nil = off
+	ramp             *ramp      // recovery ramp; nil = off
+	errorRate        *errorRate // error-rate trip rule; nil = off
+	errorRateBuckets int        // WithErrorRateBuckets; 0 = not given, merged into errorRate by New
 	admission        func(context.Context) error
 	isFailure        func(error) bool
 	onStateChange    func(from, to State)
@@ -121,15 +124,82 @@ type config struct {
 
 // WithFailureThreshold sets the number of consecutive failures, while closed,
 // that trips the circuit open. A success resets the run. Default 5.
+//
+// Zero switches the rule off, which is valid only together with
+// [WithErrorRate]: a high-volume path whose scattered errors are normal is
+// then protected by the rate alone.
 func WithFailureThreshold(n int) Option {
 	return func(c *config) error {
-		if n < 1 {
-			return fmt.Errorf("%w: WithFailureThreshold(%d): must be at least 1", ErrInvalidOption, n)
+		if n < 0 {
+			return fmt.Errorf("%w: WithFailureThreshold(%d): must not be negative", ErrInvalidOption, n)
 		}
 		c.failureThreshold = n
 		return nil
 	}
 }
+
+// WithErrorRate adds a second trip rule, for high-volume paths: the circuit
+// opens when, over the trailing window, at least minCalls calls have settled
+// while closed and the share of them that failed is at least threshold.
+// Default off.
+//
+// The consecutive rule of [WithFailureThreshold] stays in force and the
+// circuit opens when either fires. On a path doing hundreds of calls per
+// second, five consecutive failures is a coincidence and a real 30% error
+// rate rarely produces five in a row, so such a path sets the consecutive
+// threshold high, or to zero, and relies on the rate.
+//
+// Only calls settled while closed enter the window; half-open keeps its probe
+// rules. Cancellations are neutral, as everywhere else in the breaker, and
+// outcomes of calls admitted before the last transition do not enter it. The
+// window is cleared when the circuit closes, so a recovery starts with no
+// history. It is a ring of [WithErrorRateBuckets] buckets rotated lazily
+// against the clock when an outcome or an inspection arrives; no goroutine
+// wakes for it, and a quiet breaker's rate in [Stats] decays to zero as the
+// window rolls past its last outcomes.
+//
+// Sizing: make window about ten times the p99 latency, so one slow burst
+// cannot fill it; make minCalls about the calls one window sees at the lowest
+// traffic you still want protected, so a quiet period cannot trip on a
+// handful of errors; thresholds of 0.3 to 0.5 suit a dependency whose
+// scattered errors are otherwise normal. threshold must be in (0, 1], window
+// positive and minCalls at least 1.
+func WithErrorRate(threshold float64, window time.Duration, minCalls int) Option {
+	return func(c *config) error {
+		if !(threshold > 0 && threshold <= 1) || window <= 0 || minCalls < 1 { // !(…) also rejects NaN
+			return fmt.Errorf("%w: WithErrorRate(%v, %s, %d): need 0 < threshold <= 1, window > 0 and minCalls >= 1", ErrInvalidOption, threshold, window, minCalls)
+		}
+		c.errorRate = &errorRate{threshold: threshold, window: window, minCalls: minCalls, buckets: _defaultErrorRateBuckets}
+		return nil
+	}
+}
+
+// WithErrorRateBuckets sets how many buckets the [WithErrorRate] window is
+// split into. Default 10. The rate moves in steps of one bucket: an outcome
+// leaves the window together with the bucket it landed in, between
+// window − window/n and window after it was recorded, so more buckets track
+// a changing rate more closely at the cost of a slightly larger machine. n
+// must be at least 2 and each bucket must be at least a nanosecond wide.
+// Requires WithErrorRate.
+func WithErrorRateBuckets(n int) Option {
+	return func(c *config) error {
+		if n < 2 {
+			return fmt.Errorf("%w: WithErrorRateBuckets(%d): must be at least 2", ErrInvalidOption, n)
+		}
+		c.errorRateBuckets = n
+		return nil
+	}
+}
+
+// errorRate is the error-rate trip rule.
+type errorRate struct {
+	threshold float64
+	window    time.Duration
+	minCalls  int
+	buckets   int
+}
+
+const _defaultErrorRateBuckets = 10
 
 // WithSuccessThreshold sets the number of consecutive successful probes,
 // while half-open, needed to close the circuit. Default 2, deliberately not 1.
@@ -444,11 +514,16 @@ func (r Result) String() string {
 // deadline of the new open period when to is Open and the zero time
 // otherwise. Load is delivered whenever the number of calls in flight, the
 // in-flight limit or the ramping flag changes; limit is 0 when unlimited.
+// Window is delivered whenever the [WithErrorRate] window changes: after an
+// outcome enters it, after an inspection rolls old outcomes out of it, and
+// with (0, 0) when the circuit closes and clears it. It is never delivered
+// when the rule is off.
 type Observer interface {
 	Started()
 	Call(Result)
 	Transition(from, to State, consecutiveTrips int, openUntil time.Time)
 	Load(inFlight, limit int, ramping bool)
+	Window(rate float64, calls int)
 	Stopped()
 }
 
@@ -535,6 +610,15 @@ type Stats struct {
 	// has just closed and InFlightLimit is still climbing toward the ramp's
 	// end. A low cap while Ramping is recovery working as designed.
 	Ramping bool
+	// Window is the [WithErrorRate] window; 0 when the rule is off.
+	Window time.Duration
+	// WindowCalls is the calls settled while closed, cancellations excluded,
+	// in the trailing Window. 0 when the rule is off.
+	WindowCalls int
+	// ErrorRate is the share of WindowCalls that failed; 0 when WindowCalls
+	// is 0. Computed against the clock at inspection, so it decays as the
+	// window rolls even with no traffic.
+	ErrorRate float64
 
 	// Calls is every Do that reached the state goroutine, admitted or not.
 	Calls uint64
@@ -560,11 +644,12 @@ type Stats struct {
 
 // String renders the snapshot as one log line, for example:
 //
-//	breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 denied=0 ok=760 fail=9 canceled=0 in_flight=3/64 next_probe_in=23s
+//	breaker: name=db-fallback state=open trips=3(consecutive=2) calls=812 rejected=41 shed=2 denied=0 ok=760 fail=9 canceled=0 in_flight=3/64 error_rate=0.12(120) next_probe_in=23s
 //
 // in_flight shows the cap after the slash only when one is set, followed by
-// "(ramping)" during a recovery ramp; next_probe_in is present only while
-// open.
+// "(ramping)" during a recovery ramp; error_rate, with WindowCalls in
+// parentheses, is present only under [WithErrorRate]; next_probe_in is
+// present only while open.
 func (s Stats) String() string {
 	buf := fmt.Appendf(make([]byte, 0, 192), "breaker: name=%s state=%s trips=%d(consecutive=%d) calls=%d rejected=%d shed=%d denied=%d ok=%d fail=%d canceled=%d in_flight=%d",
 		s.Name, s.State, s.Trips, s.ConsecutiveTrips, s.Calls, s.Rejected, s.Shed, s.Denied, s.Successes, s.Failures, s.Canceled, s.InFlight)
@@ -573,6 +658,9 @@ func (s Stats) String() string {
 	}
 	if s.Ramping {
 		buf = append(buf, "(ramping)"...)
+	}
+	if s.Window > 0 {
+		buf = fmt.Appendf(buf, " error_rate=%.2f(%d)", s.ErrorRate, s.WindowCalls)
 	}
 	if s.State == Open {
 		buf = fmt.Appendf(buf, " next_probe_in=%s", s.NextProbeIn.Round(time.Millisecond))
@@ -685,6 +773,20 @@ func New(name string, opts ...Option) (*Breaker, error) {
 			errs = append(errs, fmt.Errorf("%w: WithRecoveryRamp end %d exceeds WithMaxInFlight %d", ErrInvalidOption, r.end, cfg.maxInFlight))
 		case cfg.aimd != nil && (r.start < cfg.aimd.min || r.end > cfg.aimd.max):
 			errs = append(errs, fmt.Errorf("%w: WithRecoveryRamp(%d, %d) outside WithAdaptiveInFlight bounds [%d, %d]", ErrInvalidOption, r.start, r.end, cfg.aimd.min, cfg.aimd.max))
+		}
+	}
+	if cfg.failureThreshold == 0 && cfg.errorRate == nil {
+		errs = append(errs, fmt.Errorf("%w: WithFailureThreshold(0) requires WithErrorRate", ErrInvalidOption))
+	}
+	if cfg.errorRateBuckets > 0 && cfg.errorRate == nil {
+		errs = append(errs, fmt.Errorf("%w: WithErrorRateBuckets requires WithErrorRate", ErrInvalidOption))
+	}
+	if r := cfg.errorRate; r != nil {
+		if cfg.errorRateBuckets > 0 {
+			r.buckets = cfg.errorRateBuckets
+		}
+		if r.window < time.Duration(r.buckets) {
+			errs = append(errs, fmt.Errorf("%w: WithErrorRate window %s split into %d buckets leaves them empty", ErrInvalidOption, r.window, r.buckets))
 		}
 	}
 	if err := errors.Join(errs...); err != nil {
@@ -922,14 +1024,89 @@ type machine struct {
 	ramping          bool   // recovery ramp in progress
 	openUntil        time.Time
 	consecutiveTrips int
+	window           *window // error-rate window; nil = off
 
 	calls, rejected, shed, denied, admitted, successes, failures, canceled, trips uint64
+}
+
+// window is the error-rate ring: buckets of equal width aligned to multiples
+// of that width since the Unix epoch, the newest at head. ok and fail are the
+// sums over the ring, so the rate costs nothing to read.
+type window struct {
+	width   time.Duration
+	buckets []bucket
+	head    int   // index of the newest bucket
+	slot    int64 // the newest bucket's slot: its start divided by width
+	ok      int
+	fail    int
+}
+
+type bucket struct{ ok, fail int }
+
+func newWindow(r *errorRate) *window {
+	return &window{width: r.window / time.Duration(r.buckets), buckets: make([]bucket, r.buckets)}
+}
+
+// rotate advances the ring to now, dropping buckets that have left the
+// window, and reports whether any outcome was dropped. A gap of a whole
+// window clears the ring; the zero slot of a fresh or cleared ring makes the
+// first rotation anchor it at now.
+func (w *window) rotate(now time.Time) bool {
+	slot := now.UnixNano() / int64(w.width)
+	k := slot - w.slot
+	if k <= 0 {
+		return false
+	}
+	dropped := false
+	if k >= int64(len(w.buckets)) {
+		dropped = w.ok+w.fail > 0
+		clear(w.buckets)
+		w.head, w.ok, w.fail = 0, 0, 0
+	} else {
+		for range k {
+			w.head = (w.head + 1) % len(w.buckets)
+			b := &w.buckets[w.head]
+			dropped = dropped || b.ok+b.fail > 0
+			w.ok -= b.ok
+			w.fail -= b.fail
+			*b = bucket{}
+		}
+	}
+	w.slot = slot
+	return dropped
+}
+
+// record enters an outcome in the bucket for now.
+func (w *window) record(now time.Time, failed bool) {
+	w.rotate(now)
+	b := &w.buckets[w.head]
+	if failed {
+		b.fail++
+		w.fail++
+	} else {
+		b.ok++
+		w.ok++
+	}
+}
+
+func (w *window) reset() {
+	clear(w.buckets)
+	w.head, w.slot, w.ok, w.fail = 0, 0, 0, 0
+}
+
+func (w *window) calls() int { return w.ok + w.fail }
+
+func (w *window) rate() float64 {
+	if c := w.calls(); c > 0 {
+		return float64(w.fail) / float64(c)
+	}
+	return 0
 }
 
 // run is the state goroutine. It exclusively owns every field of the machine:
 // the state, the consecutive counters, the generation counter, openUntil,
 // consecutiveTrips, the in-flight count, bulkhead cap and ramp flag, the
-// cumulative totals and the RNG. Nothing outside this
+// error-rate window, the cumulative totals and the RNG. Nothing outside this
 // function reads or writes them; callers observe them only through the
 // replies run sends. That single-owner discipline is what makes the absence
 // of locking sound, and it is also why the state-change hook must not call
@@ -942,6 +1119,9 @@ func (b *core) run() {
 	}
 	if b.cfg.aimd != nil {
 		m.limit = b.cfg.aimd.max
+	}
+	if b.cfg.errorRate != nil {
+		m.window = newWindow(b.cfg.errorRate)
 	}
 	m.observeLoad() // initial cap; Started could not know it
 	for {
@@ -972,6 +1152,13 @@ func (m *machine) observeCall(r Result) {
 func (m *machine) observeLoad() {
 	for _, o := range m.cfg.observers {
 		o.Load(m.inFlight, m.limit, m.ramping)
+	}
+}
+
+func (m *machine) observeWindow() {
+	rate, calls := m.window.rate(), m.window.calls()
+	for _, o := range m.cfg.observers {
+		o.Window(rate, calls)
 	}
 }
 
@@ -1069,13 +1256,14 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	}
 	switch m.state {
 	case Closed:
+		m.record(out)
 		switch out {
 		case _outcomeSuccess:
 			m.consecFailures = 0
 			m.rampStep()
 		case _outcomeFailure:
 			m.consecFailures++
-			if m.consecFailures >= m.cfg.failureThreshold {
+			if t := m.cfg.failureThreshold; t > 0 && m.consecFailures >= t {
 				m.transition(Open)
 			}
 		case _outcomeCanceled:
@@ -1084,6 +1272,7 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 		case _outcomeDenied:
 			// Never reached: handled at the top of handleSettle.
 		}
+		m.rate()
 	case HalfOpen:
 		m.probesInFlight--
 		switch out {
@@ -1103,6 +1292,29 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	case Open:
 		// Unreachable: entering Open bumps gen, so every in-flight call is
 		// stale and returned above.
+	}
+}
+
+// record enters a fresh closed-state outcome in the error-rate window.
+// Cancellations are neutral here as everywhere else.
+func (m *machine) record(out outcome) {
+	if m.window == nil || out == _outcomeCanceled {
+		return
+	}
+	m.window.record(m.cfg.now(), out == _outcomeFailure)
+	m.observeWindow()
+}
+
+// rate trips the circuit when the error-rate rule fires on the window as it
+// stands. A consecutive-failure trip on the same outcome has come first and
+// leaves nothing to do.
+func (m *machine) rate() {
+	if m.window == nil || m.state != Closed {
+		return
+	}
+	r := m.cfg.errorRate
+	if m.window.calls() >= r.minCalls && m.window.rate() >= r.threshold {
+		m.transition(Open)
 	}
 }
 
@@ -1194,6 +1406,9 @@ func (m *machine) transition(to State) {
 	case Closed:
 		m.consecutiveTrips = 0
 		m.rampStart()
+		if m.window != nil {
+			m.window.reset() // a recovery starts with no history
+		}
 	case Open:
 		m.trips++
 		m.consecutiveTrips++
@@ -1212,6 +1427,9 @@ func (m *machine) transition(to State) {
 	}
 	for _, o := range m.cfg.observers {
 		o.Transition(from, to, m.consecutiveTrips, openUntil)
+	}
+	if to == Closed && m.window != nil {
+		m.observeWindow() // the clear, reported after the transition it belongs to
 	}
 }
 
@@ -1257,6 +1475,14 @@ func (m *machine) snapshot() Stats {
 	}
 	if m.state == Open {
 		s.NextProbeIn = m.openUntil.Sub(now)
+	}
+	if m.window != nil {
+		if m.window.rotate(now) {
+			m.observeWindow() // outcomes rolled out: the gauges follow Stats
+		}
+		s.Window = m.cfg.errorRate.window
+		s.WindowCalls = m.window.calls()
+		s.ErrorRate = m.window.rate()
 	}
 	return s
 }

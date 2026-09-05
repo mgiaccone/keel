@@ -443,7 +443,7 @@
       "gridPos": {
         "x": 0,
         "y": 16,
-        "w": 24,
+        "w": 15,
         "h": 8
       },
       "datasource": {
@@ -516,6 +516,61 @@
             ]
           }
         ]
+      }
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Error rate",
+      "description": "Worst instance's share of calls in the trailing WithErrorRate window that failed, per dependency. A line climbing to the configured threshold precedes a trip by the rate rule; a flat zero is a healthy window or a breaker without the rule. The gauge follows Stats, so on an idle instance it holds its last value until something inspects the breaker.",
+      "gridPos": {
+        "x": 15,
+        "y": 16,
+        "w": 9,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS}"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS}"
+          },
+          "expr": "max by (dependency) (go_breaker_error_rate{dependency=~\"$dependency\"})",
+          "legendFormat": "{{dependency}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
       }
     },
     {

@@ -195,6 +195,9 @@ go_breaker_calls_total{dependency="events",result="success"} 1
 # HELP go_breaker_consecutive_trips Trips since the circuit last closed; drives the exponential open interval.
 # TYPE go_breaker_consecutive_trips gauge
 go_breaker_consecutive_trips{dependency="events"} 1
+# HELP go_breaker_error_rate Share of calls settled while closed that failed, over the trailing WithErrorRate window; 0 when the rule is off or the window is empty.
+# TYPE go_breaker_error_rate gauge
+go_breaker_error_rate{dependency="events"} 0
 # HELP go_breaker_in_flight Admitted calls that have not yet settled.
 # TYPE go_breaker_in_flight gauge
 go_breaker_in_flight{dependency="events"} 0
@@ -215,6 +218,9 @@ go_breaker_state{dependency="events",state="open"} 1
 # HELP go_breaker_trips_total Total closed/half-open to open transitions.
 # TYPE go_breaker_trips_total counter
 go_breaker_trips_total{dependency="events"} 1
+# HELP go_breaker_window_calls Calls settled while closed in the trailing WithErrorRate window; 0 when the rule is off.
+# TYPE go_breaker_window_calls gauge
+go_breaker_window_calls{dependency="events"} 0
 `
 	compareSeries(t, reg, dep, want)
 
@@ -319,5 +325,42 @@ func TestManyBreakersOneRegistration(t *testing.T) {
 	}
 	if n := countSeries(t, reg, "go_breaker_calls_total", "many-b"); n != 6 {
 		t.Fatalf("many-b go_breaker_calls_total series = %d, want 6", n)
+	}
+}
+
+func TestMetricsErrorRate(t *testing.T) {
+	reg := registry(t)
+	const dep = "rate"
+	h := newNamedHarness(t, dep, WithFailureThreshold(100), WithErrorRate(0.5, 100*time.Millisecond, 100))
+	h.fail(t)
+	h.fail(t)
+	h.ok(t)
+	h.ok(t)
+	want := `
+# HELP go_breaker_error_rate Share of calls settled while closed that failed, over the trailing WithErrorRate window; 0 when the rule is off or the window is empty.
+# TYPE go_breaker_error_rate gauge
+go_breaker_error_rate{dependency="rate"} 0.5
+# HELP go_breaker_window_calls Calls settled while closed in the trailing WithErrorRate window; 0 when the rule is off.
+# TYPE go_breaker_window_calls gauge
+go_breaker_window_calls{dependency="rate"} 4
+`
+	compareSeries(t, reg, dep, want, "go_breaker_error_rate", "go_breaker_window_calls")
+
+	// An inspection that rolls outcomes out of the window updates the gauges.
+	h.clock.Add(100 * time.Millisecond)
+	h.Stats()
+	want = `
+# HELP go_breaker_error_rate Share of calls settled while closed that failed, over the trailing WithErrorRate window; 0 when the rule is off or the window is empty.
+# TYPE go_breaker_error_rate gauge
+go_breaker_error_rate{dependency="rate"} 0
+# HELP go_breaker_window_calls Calls settled while closed in the trailing WithErrorRate window; 0 when the rule is off.
+# TYPE go_breaker_window_calls gauge
+go_breaker_window_calls{dependency="rate"} 0
+`
+	compareSeries(t, reg, dep, want, "go_breaker_error_rate", "go_breaker_window_calls")
+
+	h.Stop()
+	if n := countSeries(t, reg, "go_breaker_error_rate", dep) + countSeries(t, reg, "go_breaker_window_calls", dep); n != 0 {
+		t.Fatalf("%d window series survive Stop", n)
 	}
 }
