@@ -113,6 +113,7 @@ func NewTransport(r *Retrier, next http.RoundTripper, opts ...TransportOption) (
 	if next == nil {
 		next = http.DefaultTransport
 	}
+
 	t := &Transport{
 		retrier:       r,
 		next:          next,
@@ -152,6 +153,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !t.replayable(req) {
 		return t.next.RoundTrip(req)
 	}
+
 	// Attempts may run concurrently under WithHedge, so the only state they
 	// share is the attempt counter; superseded and losing responses come back
 	// through the discard hook, which is what closes their bodies.
@@ -170,6 +172,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		} else if ctx != req.Context() {
 			r = req.Clone(ctx) // a hedged first attempt: its own headers, since a hedge is cloning them concurrently
 		}
+
 		resp, err := t.next.RoundTrip(r)
 		if err != nil {
 			return nil, err
@@ -177,6 +180,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if !t.retryResponse(resp) {
 			return resp, nil
 		}
+
 		buffer(resp) // a small body frees the connection before the wait; a large one is drained when superseded
 		return resp, &StatusError{Status: resp.StatusCode, RetryAfter: t.retryAfter(resp)}
 	}, func(resp *http.Response, _ error) {
@@ -184,6 +188,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			drain(resp.Body)
 		}
 	})
+
 	var se *StatusError
 	if errors.As(err, &se) {
 		return resp, nil
@@ -198,6 +203,7 @@ func (t *Transport) replayable(req *http.Request) bool {
 	if req.Body != nil && req.Body != http.NoBody && req.GetBody == nil {
 		return false
 	}
+
 	method := req.Method
 	if method == "" {
 		method = http.MethodGet
@@ -205,6 +211,7 @@ func (t *Transport) replayable(req *http.Request) bool {
 	if t.methods[method] {
 		return true
 	}
+
 	_, a := req.Header["Idempotency-Key"]
 	_, b := req.Header["X-Idempotency-Key"]
 	return a || b
@@ -231,6 +238,7 @@ func (t *Transport) retryAfter(resp *http.Response) time.Duration {
 // untouched, when the body is larger than _bufferLimit.
 func buffer(resp *http.Response) bool {
 	data, err := io.ReadAll(io.LimitReader(resp.Body, _bufferLimit+1))
+
 	if err != nil || len(data) > _bufferLimit {
 		if len(data) > 0 {
 			// Give back what was read, ahead of the rest.

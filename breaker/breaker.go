@@ -792,6 +792,7 @@ func New(name string, opts ...Option) (*Breaker, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
+
 	// Every breaker feeds the package metrics; Register decides whether those
 	// are published.
 	cfg.observers = append([]Observer{&metricsObserver{dep: cfg.name}}, cfg.observers...)
@@ -810,6 +811,7 @@ func New(name string, opts ...Option) (*Breaker, error) {
 		stopped: make(chan struct{}),
 		tokens:  make(chan token, _tokenPoolSize),
 	}
+
 	// Started runs here, on the caller's goroutine, so that when New returns
 	// every observer has seen the breaker; the state goroutine takes over
 	// from there.
@@ -853,9 +855,11 @@ func (b *Breaker) Do[T any](ctx context.Context, fn func(context.Context) (T, er
 	if err != nil {
 		return zero, err
 	}
+
 	out := _outcomeFailure // a panic in fn leaves this set: counted as a failure
 	start := b.cfg.now()
 	defer func() { b.release(tok, gen, out, b.cfg.now().Sub(start)) }()
+
 	if b.cfg.admission != nil {
 		if err := b.cfg.admission(ctx); err != nil {
 			out = _outcomeDenied
@@ -863,11 +867,13 @@ func (b *Breaker) Do[T any](ctx context.Context, fn func(context.Context) (T, er
 		}
 		start = b.cfg.now() // the veto's latency is not the backend's
 	}
+
 	if b.cfg.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, b.cfg.timeout)
 		defer cancel()
 	}
+
 	v, err := fn(ctx)
 	out = b.classify(err)
 	return v, err
@@ -901,6 +907,7 @@ func (b *core) acquire(ctx context.Context) (token, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
 	}
+
 	tok := b.getToken()
 	select {
 	case b.admit <- tok:
@@ -911,6 +918,7 @@ func (b *core) acquire(ctx context.Context) (token, uint64, error) {
 		b.putToken(tok)
 		return nil, 0, ErrStopped
 	}
+
 	switch r := <-tok; r {
 	case _replyOpen:
 		b.putToken(tok)
@@ -1060,10 +1068,12 @@ func (w *window) rotate(now time.Time) bool {
 		w.slot, w.anchored = slot, true
 		return false
 	}
+
 	k := slot - w.slot
 	if k <= 0 {
 		return false
 	}
+
 	dropped := false
 	if k >= int64(len(w.buckets)) {
 		dropped = w.ok+w.fail > 0
@@ -1079,6 +1089,7 @@ func (w *window) rotate(now time.Time) bool {
 			*b = bucket{}
 		}
 	}
+
 	w.slot = slot
 	return dropped
 }
@@ -1131,6 +1142,7 @@ func (b *core) run() {
 		m.window = newWindow(b.cfg.errorRate)
 	}
 	m.observeLoad() // initial cap; Started could not know it
+
 	for {
 		select {
 		case tok := <-b.admit:
@@ -1184,6 +1196,7 @@ func (m *machine) expire(now time.Time) {
 func (m *machine) handleAdmit() uint64 {
 	m.expire(m.cfg.now())
 	m.calls++
+
 	switch m.state {
 	case Closed:
 		return m.admitOrShed()
@@ -1228,6 +1241,7 @@ func (m *machine) admitOrShed() uint64 {
 func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	defer m.observeLoad() // after any transition below, so the cap it set is seen
 	m.inFlight--          // every admitted call settles exactly once, stale or not
+
 	if out == _outcomeDenied {
 		// The veto refused the call after the circuit let it through: it never
 		// ran, so it is denied rather than admitted, and nothing about the
@@ -1239,6 +1253,7 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 		}
 		return
 	}
+
 	m.adapt(out, elapsed)
 	m.admitted++
 	switch out {
@@ -1254,6 +1269,7 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	case _outcomeDenied:
 		// Counted before the stale check; a denial says nothing about the backend.
 	}
+
 	// A stale outcome belongs to a call admitted before the last transition.
 	// It has been counted above but must not drive the state machine: a slow
 	// success from before a trip says nothing about the backend now, and
@@ -1261,9 +1277,11 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 	if gen != m.gen {
 		return
 	}
+
 	switch m.state {
 	case Closed:
 		m.record(out)
+
 		switch out {
 		case _outcomeSuccess:
 			m.consecFailures = 0
@@ -1279,9 +1297,11 @@ func (m *machine) handleSettle(gen uint64, out outcome, elapsed time.Duration) {
 		case _outcomeDenied:
 			// Never reached: handled at the top of handleSettle.
 		}
+
 		m.rate()
 	case HalfOpen:
 		m.probesInFlight--
+
 		switch out {
 		case _outcomeSuccess:
 			m.consecSuccesses++
@@ -1332,6 +1352,7 @@ func (m *machine) adapt(out outcome, elapsed time.Duration) {
 	if a == nil {
 		return
 	}
+
 	prev := m.limit
 	defer func() {
 		// Under AIMD the ramp is only a seed: it is over once AIMD has grown
@@ -1340,6 +1361,7 @@ func (m *machine) adapt(out outcome, elapsed time.Duration) {
 			m.ramping = false
 		}
 	}()
+
 	switch out {
 	case _outcomeSuccess:
 		if elapsed <= a.target {
@@ -1409,6 +1431,7 @@ func (m *machine) transition(to State) {
 	m.consecFailures = 0
 	m.consecSuccesses = 0
 	m.probesInFlight = 0
+
 	switch to {
 	case Closed:
 		m.consecutiveTrips = 0
@@ -1425,9 +1448,11 @@ func (m *machine) transition(to State) {
 		// Nothing beyond the common resets: the probe budget starts fresh
 		// and the open deadline is left for Stats to stop reporting.
 	}
+
 	if m.cfg.onStateChange != nil {
 		m.cfg.onStateChange(from, to)
 	}
+
 	var openUntil time.Time
 	if to == Open {
 		openUntil = m.openUntil
@@ -1435,6 +1460,7 @@ func (m *machine) transition(to State) {
 	for _, o := range m.cfg.observers {
 		o.Transition(from, to, m.consecutiveTrips, openUntil)
 	}
+
 	if to == Closed && m.window != nil {
 		m.observeWindow() // the clear, reported after the transition it belongs to
 	}
@@ -1454,6 +1480,7 @@ func (m *machine) openInterval() time.Duration {
 		d *= 2
 	}
 	d = min(d, m.cfg.openMax)
+
 	if j := m.cfg.openJitter; j > 0 {
 		d = time.Duration(float64(d) * (1 + j*(2*m.rng.Float64()-1)))
 	}
@@ -1463,6 +1490,7 @@ func (m *machine) openInterval() time.Duration {
 func (m *machine) snapshot() Stats {
 	now := m.cfg.now()
 	m.expire(now)
+
 	s := Stats{
 		Name:             m.cfg.name,
 		State:            m.state,
@@ -1480,9 +1508,11 @@ func (m *machine) snapshot() Stats {
 		Canceled:         m.canceled,
 		Trips:            m.trips,
 	}
+
 	if m.state == Open {
 		s.NextProbeIn = m.openUntil.Sub(now)
 	}
+
 	if m.window != nil {
 		if m.window.rotate(now) {
 			m.observeWindow() // outcomes rolled out: the gauges follow Stats

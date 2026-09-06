@@ -79,9 +79,11 @@ func (g gcra) Step(s State, now time.Time) (State, Decision) {
 	T := g.interval()
 	tolerance := int64(g.burst-1) * T
 	tat := max(s.A, t) // a TAT in the past means a full bucket
+
 	if tat-t > tolerance {
 		return s, Decision{RetryAfter: time.Duration(tat - t - tolerance)}
 	}
+
 	next := tat + T
 	remaining := int((t + int64(g.burst)*T - next) / T)
 	return State{A: next}, Decision{Allowed: true, Remaining: remaining}
@@ -126,6 +128,7 @@ func (f fixedWindow) Step(s State, now time.Time) (State, Decision) {
 	if s.A != start {
 		count = 0
 	}
+
 	if count >= int64(f.limit) {
 		return s, Decision{RetryAfter: time.Duration(start + w - t)}
 	}
@@ -195,6 +198,7 @@ func (s slidingWindow) Step(st State, now time.Time) (State, Decision) {
 		remaining := room - ceilMulDiv(prev, w-elapsed, w)
 		return State{A: start, B: cur + 1, C: prev}, Decision{Allowed: true, Remaining: int(remaining)}
 	}
+
 	var wait int64
 	if room >= 0 {
 		// prev > 0 here, or the call would have been admitted. It must decay

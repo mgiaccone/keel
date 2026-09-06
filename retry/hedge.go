@@ -56,6 +56,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 				o.Hedge(attempts)
 			}
 		}
+
 		actx, cancel := context.WithCancel(ctx)
 		cancels = append(cancels, cancel)
 		inFlight++
@@ -69,6 +70,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 			results <- outcome[T]{v: v, err: err, attempt: n, hedge: hedge}
 		}(attempts)
 	}
+
 	// arm starts the hedge timer through the configured sleep, unless nothing
 	// more may start. The previous timer is dropped first, so a fire it
 	// buffered before being cancelled can never be read.
@@ -78,23 +80,27 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 		if attempts >= r.cfg.maxAttempts || denied {
 			return
 		}
+
 		var tctx context.Context
 		tctx, tcancel = context.WithCancel(ctx)
 		ch := make(chan error, 1)
 		timer = ch
 		go func() { ch <- r.cfg.sleep(tctx, r.cfg.hedge) }()
 	}
+
 	// leave ends the call: it stops the timer, cancels every attempt but the
 	// one whose result is returned, and drains the results of the attempts still in flight, into
 	// the discard hook when there is one. A loser that panics after the call
 	// has returned panics there rather than being swallowed.
 	leave := func(returned int) {
 		tcancel()
+
 		for i, c := range cancels {
 			if i+1 != returned {
 				c()
 			}
 		}
+
 		if inFlight > 0 {
 			go func(n int) {
 				for range n {
@@ -109,6 +115,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 			}(inFlight)
 		}
 	}
+
 	// supersede discards the pending failed result, which will not be
 	// returned, and ends its attempt's context.
 	supersede := func() {
@@ -132,6 +139,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 				supersede()
 				panic(o.panicked)
 			}
+
 			if o.err == nil {
 				leave(o.attempt) // the losers' contexts end first, so a pending body drains fast
 				supersede()
@@ -142,6 +150,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 				}
 				return o.v, nil
 			}
+
 			supersede()
 			pending = &o
 			if ctx.Err() != nil {
@@ -158,6 +167,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 			if inFlight > 0 {
 				continue // nothing starts because of a failure; the timer keeps running
 			}
+
 			// Every attempt has answered and failed: the ordinary retry path.
 			// The last failure's context stays alive until it is returned or
 			// superseded, so what it produced is usable either way.
@@ -170,6 +180,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 				r.end(Budget, attempts)
 				return o.v, unwrapPermanent(o.err)
 			}
+
 			if r.cfg.budget != nil {
 				if err := r.cfg.budget(ctx); err != nil {
 					if r.cfg.onRetry != nil {
@@ -192,6 +203,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 				r.end(Canceled, attempts)
 				return o.v, unwrapPermanent(o.err)
 			}
+
 			supersede() // superseded by the retry about to start
 			start(false)
 			arm()
@@ -200,6 +212,7 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 			if err != nil || ctx.Err() != nil || attempts >= r.cfg.maxAttempts || denied {
 				continue // the caller's context is done, or nothing more may start: not re-armed
 			}
+
 			if r.cfg.budget != nil {
 				if err := r.cfg.budget(ctx); err != nil {
 					denied = true

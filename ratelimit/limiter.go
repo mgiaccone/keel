@@ -67,6 +67,7 @@ func New(name string, algorithm Algorithm, store Store, opts ...Option) (*Limite
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
+
 	l.metrics = newMetrics(name, algorithm.Name())
 	l.metrics.started()
 	if _, ok := store.(KeyCounter); ok {
@@ -84,15 +85,18 @@ func (l *Limiter) Allow(ctx context.Context, key string) (Decision, error) {
 		}
 		return l.decided(d), nil
 	}
+
 	for attempt := 0; attempt < l.maxAttempts; attempt++ {
 		rec, now, err := l.store.Get(ctx, key)
 		if err != nil {
 			return l.fail(fmt.Errorf("ratelimit: store get: %w", err))
 		}
+
 		next, d := l.algorithm.Step(rec.State, now)
 		if next == rec.State {
 			return l.decided(d), nil // nothing to write
 		}
+
 		ok, err := l.store.CompareAndSet(ctx, key, rec.Version, next, l.algorithm.TTL())
 		if err != nil {
 			return l.fail(fmt.Errorf("ratelimit: store compare-and-set: %w", err))

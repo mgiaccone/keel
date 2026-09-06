@@ -84,6 +84,7 @@ func (c *keysCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, l := range c.live() {
 		totals[series{l.name, l.algorithm.Name()}] += l.store.(KeyCounter).Keys()
 	}
+
 	for s, n := range totals {
 		if m, err := prometheus.NewConstMetric(_keysDesc, prometheus.GaugeValue, float64(n), s.name, s.algorithm); err == nil {
 			ch <- m

@@ -128,6 +128,7 @@ func Admission(l Allower, key string) func(context.Context) error {
 		if err != nil {
 			return err
 		}
+
 		if !d.Allowed {
 			return &LimitedError{Key: key, RetryAfter: d.RetryAfter}
 		}

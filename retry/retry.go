@@ -390,11 +390,13 @@ func New(name string, backoff Backoff, opts ...Option) (*Retrier, error) {
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
+
 	metrics := &metricsObserver{name: name, backoff: backoff.Name()}
 	cfg.observers = append([]Observer{metrics}, cfg.observers...)
 	if cfg.seed == [2]uint64{} {
 		cfg.seed = [2]uint64{rand.Uint64(), rand.Uint64()}
 	}
+
 	r := &Retrier{cfg: cfg, metrics: metrics, rng: rand.New(rand.NewPCG(cfg.seed[0], cfg.seed[1]))}
 	for _, o := range cfg.observers {
 		o.Started()
@@ -450,6 +452,7 @@ func do[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T, err
 			}
 			return v, unwrapPermanent(last)
 		}
+
 		if attempts > 0 && discard != nil {
 			discard(v, last) // superseded by the attempt about to start
 		}
@@ -458,11 +461,13 @@ func do[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T, err
 		for _, o := range r.cfg.observers {
 			o.Attempt(attempts)
 		}
+
 		v, last = fn(ctx)
 		if last == nil {
 			r.end(Success, attempts)
 			return v, nil
 		}
+
 		if ctx.Err() != nil {
 			r.end(Canceled, attempts)
 			return v, unwrapPermanent(last)
@@ -476,6 +481,7 @@ func do[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T, err
 			r.end(Exhausted, attempts)
 			return v, unwrapPermanent(last)
 		}
+
 		if r.cfg.budget != nil {
 			if err := r.cfg.budget(ctx); err != nil {
 				if r.cfg.onRetry != nil {

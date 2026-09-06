@@ -129,6 +129,7 @@ func Middleware(l Allower, key KeyFunc, opts ...MiddlewareOption) (func(http.Han
 	if err := errors.Join(errs...); err != nil {
 		return nil, err
 	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			d, err := l.Allow(r.Context(), key(r))
@@ -136,6 +137,7 @@ func Middleware(l Allower, key KeyFunc, opts ...MiddlewareOption) (func(http.Han
 				if cfg.onError != nil {
 					cfg.onError(r, err)
 				}
+
 				if cfg.failOpen {
 					next.ServeHTTP(w, r)
 				} else {
@@ -143,9 +145,11 @@ func Middleware(l Allower, key KeyFunc, opts ...MiddlewareOption) (func(http.Han
 				}
 				return
 			}
+
 			if cfg.remaining && d.Remaining >= 0 {
 				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(d.Remaining))
 			}
+
 			if !d.Allowed {
 				w.Header().Set("Retry-After", strconv.Itoa(int(math.Ceil(d.RetryAfter.Seconds()))))
 				cfg.limited.ServeHTTP(w, r)

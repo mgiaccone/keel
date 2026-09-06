@@ -112,6 +112,7 @@ func (s *Store) Get(ctx context.Context, key string) (ratelimit.Record, time.Tim
 	if len(values) != 6 {
 		return ratelimit.Record{}, time.Time{}, fmt.Errorf("redistore: %q: script returned %d values, want 6", key, len(values))
 	}
+
 	var secs, micros int64
 	if err := parseField(values[0], &secs); err != nil {
 		return ratelimit.Record{}, time.Time{}, fmt.Errorf("redistore: %q: TIME seconds: %w", key, err)
@@ -152,6 +153,7 @@ func parseField(v any, dst *int64) error {
 func (s *Store) CompareAndSet(ctx context.Context, key string, expect uint64, state ratelimit.State, ttl time.Duration) (bool, error) {
 	keys := []string{s.prefix + key}
 	args := []any{expect, state.A, state.B, state.C, max(ttl.Milliseconds(), 1)}
+
 	written, err := _cas.Run(ctx, s.client, keys, args...).Int()
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return false, err

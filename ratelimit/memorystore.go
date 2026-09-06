@@ -84,6 +84,7 @@ func (m *MemoryStore) Get(_ context.Context, key string) (Record, time.Time, err
 	if r == nil {
 		return Record{}, now, nil
 	}
+
 	m.lru.MoveToFront(r.elem)
 	return Record{State: r.state, Version: r.version}, now, nil
 }
@@ -94,13 +95,16 @@ func (m *MemoryStore) CompareAndSet(_ context.Context, key string, expect uint64
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.lookup(key, now)
+
 	var current uint64
 	if r != nil {
 		current = r.version
 	}
+
 	if current != expect {
 		return false, nil
 	}
+
 	m.put(r, key, state, now.Add(ttl))
 	return true, nil
 }
@@ -112,10 +116,12 @@ func (m *MemoryStore) Update(_ context.Context, key string, algorithm Algorithm)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r := m.lookup(key, now)
+
 	var current State
 	if r != nil {
 		current = r.state
 	}
+
 	next, d := algorithm.Step(current, now)
 	if next == current {
 		if r != nil {
@@ -123,6 +129,7 @@ func (m *MemoryStore) Update(_ context.Context, key string, algorithm Algorithm)
 		}
 		return d, nil
 	}
+
 	m.put(r, key, next, now.Add(algorithm.TTL()))
 	return d, nil
 }
@@ -156,6 +163,7 @@ func (m *MemoryStore) put(r *memRecord, key string, state State, expires time.Ti
 	} else {
 		m.lru.MoveToFront(r.elem)
 	}
+
 	r.state, r.version, r.expires = state, m.version, expires
 }
 

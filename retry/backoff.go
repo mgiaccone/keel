@@ -79,10 +79,12 @@ func (d decorrelated) Delay(_ int, previous time.Duration, u float64) time.Durat
 	if previous < d.base {
 		previous = d.base
 	}
+
 	upper := d.max
 	if previous < d.max/3 {
 		upper = 3 * previous
 	}
+
 	if upper <= d.base {
 		return d.base
 	}
@@ -110,6 +112,7 @@ func (f fibonacci) Delay(retry int, _ time.Duration, u float64) time.Duration {
 			a, b = b, a+b
 		}
 	}
+
 	return jitter(min(a, f.max), u)
 }
 
