@@ -253,6 +253,7 @@ func TestMetricsInFlightAndLimit(t *testing.T) {
 	recv(t, entered)
 	recv(t, entered)
 	h.ok(t) // shed
+
 	want := `
 # HELP go_breaker_in_flight Admitted calls that have not yet settled.
 # TYPE go_breaker_in_flight gauge
@@ -262,9 +263,11 @@ go_breaker_in_flight{dependency="load"} 2
 go_breaker_in_flight_limit{dependency="load"} 2
 `
 	compareSeries(t, reg, dep, want, "go_breaker_in_flight", "go_breaker_in_flight_limit")
+
 	if v := testutil.ToFloat64(_callsCounter.WithLabelValues("load", "shed")); v != 1 {
 		t.Fatalf("shed = %v, want 1", v)
 	}
+
 	close(finish)
 }
 

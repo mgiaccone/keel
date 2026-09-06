@@ -172,16 +172,20 @@ func TestAdmissionKeepsKeysApart(t *testing.T) {
 	if err := a(ctx); err != nil {
 		t.Fatalf("tenant-a: %v", err)
 	}
+
 	if err := b(ctx); err != nil {
 		t.Fatalf("tenant-b has its own budget: %v", err)
 	}
+
 	var lim *LimitedError
 	if err := a(ctx); !errors.As(err, &lim) || lim.Key != "tenant-a" || !strings.Contains(err.Error(), `"tenant-a"`) {
 		t.Fatalf("err = %v, lim = %+v", err, lim)
 	}
+
 	if err := AdmissionGlobal(h.Limiter)(ctx); err != nil { // a third budget, not a wildcard
 		t.Fatalf("global: %v", err)
 	}
+
 	if s := h.Stats(); s.Keys != 3 {
 		t.Fatalf("stats = %+v, want three records", s)
 	}

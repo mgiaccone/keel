@@ -438,12 +438,15 @@ func TestStatsIdentityUnderConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 	s := h.Stats()
+
 	if s.Calls != 32*50 || s.Succeeded+s.Exhausted+s.Aborted+s.Canceled+s.BudgetDenied != s.Calls {
 		t.Fatalf("identity broken: %+v", s)
 	}
+
 	if s.Attempts < s.Calls || s.Attempts > 3*s.Calls {
 		t.Fatalf("attempts out of range: %+v", s)
 	}
+
 	if s.Succeeded == 0 || s.Exhausted == 0 || s.Aborted == 0 || s.Canceled == 0 || s.BudgetDenied == 0 {
 		t.Fatalf("not every path exercised: %+v", s)
 	}

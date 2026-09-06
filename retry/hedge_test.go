@@ -160,20 +160,25 @@ func TestHedgeOvertakesSlowAttempt(t *testing.T) {
 	if r := await(t, done); r.err != nil || r.v != 7 {
 		t.Fatalf("Do = %+v", r)
 	}
+
 	if !cancelled(g.ctx(1)) {
 		t.Fatal("the losing attempt was not cancelled")
 	}
+
 	if g.ctx(2).Err() != nil {
 		t.Fatal("the winner's context was cancelled; a value that uses it after Do returned would break")
 	}
+
 	if s := h.Stats(); s.Attempts != 2 || s.Hedged != 1 || s.HedgeWon != 1 || s.Succeeded != 1 || s.HedgeAfter != 5*time.Millisecond {
 		t.Fatalf("stats = %+v", s)
 	}
+
 	g.finish(t, 1, 0, context.Canceled) // the loser answers late; nothing changes
 	want := []string{"started", "attempt:1", "attempt:2", "hedge:2", "call:success/2"}
 	if !slices.Equal(rec.events, want) {
 		t.Fatalf("events %q, want %q", rec.events, want)
 	}
+
 	if s := h.Stats(); s.Attempts != 2 || s.Calls != 1 {
 		t.Fatalf("a late loser changed the stats: %+v", s)
 	}
@@ -292,6 +297,7 @@ func TestHedgeBudget(t *testing.T) {
 			t.Fatalf("hook saw %v, want the veto's error %v", hooked, want)
 		}
 	})
+
 	t.Run("a refusal followed by failure ends the call as budget", func(t *testing.T) {
 		h := newHedged(t, 5*time.Millisecond, true, WithMaxAttempts(3),
 			WithBudget(func(context.Context) error { return errNoBudget }))
@@ -308,6 +314,7 @@ func TestHedgeBudget(t *testing.T) {
 			t.Fatalf("stats = %+v, waits = %v", s, h.recorded())
 		}
 	})
+
 	t.Run("asked before every hedge", func(t *testing.T) {
 		asked := 0
 		h := newHedged(t, 5*time.Millisecond, true, WithMaxAttempts(3),
@@ -563,15 +570,19 @@ func TestHedgeStatsIdentitiesUnderChaos(t *testing.T) {
 	}
 	wg.Wait()
 	s := h.Stats()
+
 	if s.Calls != workers*calls || s.Succeeded+s.Exhausted+s.Aborted+s.Canceled+s.BudgetDenied != s.Calls {
 		t.Fatalf("identity broken: %+v", s)
 	}
+
 	if s.Attempts < s.Calls || s.Attempts > 3*s.Calls || s.Hedged > s.Attempts-s.Calls || s.HedgeWon > s.Hedged || s.HedgeWon > s.Succeeded {
 		t.Fatalf("hedge identities broken: %+v", s)
 	}
+
 	if s.Succeeded == 0 || s.Exhausted == 0 || s.Aborted == 0 || s.Canceled == 0 || s.BudgetDenied == 0 || s.Hedged == 0 || s.HedgeWon == 0 {
 		t.Fatalf("not every path exercised: %+v", s)
 	}
+
 	if n := deepest.max.Load(); n > 3 {
 		t.Fatalf("a call reached attempt %d past a cap of 3: a stale hedge timer started it", n)
 	}

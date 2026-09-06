@@ -18,25 +18,31 @@ func TestGCRAIsATokenBucket(t *testing.T) {
 			t.Fatalf("call %d: %+v", i, d)
 		}
 	}
+
 	s2, d := g.Step(s, now)
 	if d.Allowed || d.RetryAfter != 100*time.Millisecond || s2 != s {
 		t.Fatalf("fourth: %+v, state changed: %v", d, s2 != s)
 	}
+
 	if _, d := g.Step(s, now.Add(50*time.Millisecond)); d.Allowed || d.RetryAfter != 50*time.Millisecond {
 		t.Fatalf("after 50ms: %+v", d)
 	}
+
 	if s, d = g.Step(s, now.Add(100*time.Millisecond)); !d.Allowed || d.Remaining != 0 {
 		t.Fatalf("after 100ms: %+v", d)
 	}
+
 	// Refill caps at burst.
 	for i := range 3 {
 		if s, d = g.Step(s, now.Add(time.Hour)); !d.Allowed || d.Remaining != 2-i {
 			t.Fatalf("after idle %d: %+v", i, d)
 		}
 	}
+
 	if _, d = g.Step(s, now.Add(time.Hour)); d.Allowed {
 		t.Fatalf("burst exceeded: %+v", d)
 	}
+
 	if g.TTL() != 600*time.Millisecond {
 		t.Fatalf("TTL = %s, want 2 × burst/rate", g.TTL())
 	}

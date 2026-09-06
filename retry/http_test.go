@@ -328,9 +328,11 @@ func TestTransportCustomPredicateAndHook(t *testing.T) {
 	if resp := th.do(t, http.MethodGet, nil); resp.StatusCode != 200 {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
+
 	if len(seen) != 1 || seen[0] != "retry: HTTP 500 Internal Server Error, retry after 1s" {
 		t.Fatalf("hook saw %q", seen)
 	}
+
 	var se *StatusError
 	if err := error(&StatusError{Status: 503}); !errors.As(err, &se) || !se.Retryable() || se.RetryDelay() != 0 || err.Error() != "retry: HTTP 503 Service Unavailable" {
 		t.Fatalf("StatusError: %v", err)

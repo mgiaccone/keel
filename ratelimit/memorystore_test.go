@@ -18,9 +18,11 @@ func TestMemoryStoreEvictsLRU(t *testing.T) {
 	if h.store.Keys() != 2 {
 		t.Fatalf("keys = %d", h.store.Keys())
 	}
+
 	if d := h.allow(t, "b"); !d.Allowed {
 		t.Fatal("evicted key should return as fresh")
 	}
+
 	if d := h.allow(t, "c"); d.Allowed {
 		t.Fatal("c was kept and should still be exhausted")
 	}

@@ -73,13 +73,16 @@ func TestLimiterRetriesConflictsThenGivesUp(t *testing.T) {
 	if d, err := l.Allow(context.Background(), "k"); err != nil || !d.Allowed {
 		t.Fatalf("two conflicts within the budget: %+v %v", d, err)
 	}
+
 	if s := l.Stats(); s.Conflicts != 2 || s.Allowed != 1 {
 		t.Fatalf("stats = %+v", s)
 	}
+
 	cs.remaining.Store(3)
 	if _, err := l.Allow(context.Background(), "k"); !errors.Is(err, ErrContention) {
 		t.Fatalf("err = %v, want ErrContention", err)
 	}
+
 	if s := l.Stats(); s.Errors != 1 || s.Conflicts != 5 {
 		t.Fatalf("stats = %+v", s)
 	}
@@ -97,9 +100,11 @@ func TestLimiterStoreErrorsAreNotDecisions(t *testing.T) {
 	if _, err := l.Allow(context.Background(), ""); !errors.Is(err, boom) {
 		t.Fatalf("err = %v", err)
 	}
+
 	if s := l.Stats(); s.Errors != 1 || s.Allowed != 0 || s.Limited != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
+
 	if v := testutil.ToFloat64(_decisionsCounter.WithLabelValues(name, "gcra", "error")); v != 1 {
 		t.Fatalf("error metric = %v", v)
 	}
@@ -149,9 +154,11 @@ func TestCASPathUnderContention(t *testing.T) {
 	}
 	wg.Wait()
 	s := l.Stats()
+
 	if allowed.Load() != 40 || s.Allowed != 40 || s.Limited != 320-40 || s.Errors != 0 {
 		t.Fatalf("stats = %+v, allowed = %d; a lost update would show as more than 40 allowed", s, allowed.Load())
 	}
+
 	t.Logf("conflicts retried: %d", s.Conflicts)
 }
 

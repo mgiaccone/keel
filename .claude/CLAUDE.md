@@ -38,6 +38,19 @@ makes a change feel like it belongs, and a reviewer will read a violation as a m
 - **Doc comments say what goes wrong.** Every exported identifier's comment explains the mistake it
   invites, not only what it does — see almost any `With*` option in `breaker/breaker.go` for the
   pattern (the failure mode is stated before or after the mechanics, not left implicit).
+- **No narrative or section comments.** No ASCII-art dividers (`// --- Section ---`), no banners
+  grouping several functions or restating what a following block of code already says in its own
+  names. A comment earns its place only when the code beside it isn't self-explanatory — a
+  non-obvious reason, a constraint the reader can't see locally (e.g. `hedge.go`'s note that `os.Exit`
+  runs no deferred function, or `breaker.go`'s note on why the receive after a channel send can't be
+  raced against `ctx`). Doc comments on exported identifiers are the one standing exception; they're
+  expected regardless, per the rule above.
+- **A blank line between a function's distinct phases.** Construct/setup, then each separately
+  meaningful loop or check, gets its own paragraph — not because of length, a short function is
+  often one phase and needs nothing, but because the reader should be able to tell where one step
+  ends and the next begins without parsing every line. A constructor's own run of `if cfg.X == bad
+  { errs = append(...) }` validation checks is one phase, not one per check — don't break those
+  apart. This applies to production code the same as tests; it isn't a test-only habit.
 - **Naming.** Unexported package-level variables and constants carry a leading underscore
   (`_defaultErrorRateBuckets`, `_bufferLimit`); types and functions do not.
 

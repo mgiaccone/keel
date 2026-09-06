@@ -486,15 +486,19 @@ func TestConcurrentAccounting(t *testing.T) {
 	}
 	wg.Wait()
 	s := h.Stats()
+
 	if s.Calls != goroutines*perGoroutine {
 		t.Fatalf("Calls = %d, want %d", s.Calls, goroutines*perGoroutine)
 	}
+
 	if s.Admitted+s.Rejected+s.Shed+s.Denied != s.Calls {
 		t.Fatalf("Admitted(%d) + Rejected(%d) + Shed(%d) + Denied(%d) != Calls(%d)", s.Admitted, s.Rejected, s.Shed, s.Denied, s.Calls)
 	}
+
 	if s.Successes+s.Failures+s.Canceled != s.Admitted {
 		t.Fatalf("Successes(%d) + Failures(%d) + Canceled(%d) != Admitted(%d)", s.Successes, s.Failures, s.Canceled, s.Admitted)
 	}
+
 	if s.Trips == 0 || s.Rejected == 0 {
 		t.Fatalf("test did not exercise the open path: %+v", s)
 	}
@@ -985,22 +989,27 @@ func TestAdaptiveInFlightAIMD(t *testing.T) {
 	if limit() != 8 {
 		t.Fatalf("initial limit = %d, want max (8)", limit())
 	}
+
 	h.slow(t, 200*time.Millisecond, nil) // slow success halves
 	if limit() != 4 {
 		t.Fatalf("after slow call: %d, want 4", limit())
 	}
+
 	h.slow(t, time.Millisecond, errBoom) // failure halves
 	if limit() != 2 {
 		t.Fatalf("after failure: %d, want 2", limit())
 	}
+
 	h.slow(t, time.Millisecond, errBoom) // floor
 	if limit() != 2 {
 		t.Fatalf("below min: %d", limit())
 	}
+
 	h.slow(t, time.Millisecond, context.Canceled) // neutral
 	if limit() != 2 {
 		t.Fatalf("cancellation moved the limit: %d", limit())
 	}
+
 	for i := range 10 {
 		h.slow(t, 50*time.Millisecond, nil) // fast success: +1 up to max
 		if want := min(3+i, 8); limit() != want {
@@ -1194,16 +1203,20 @@ func TestAdmissionDeniedIsNeutralAndUnadmitted(t *testing.T) {
 	if !errors.Is(err, errDenied) || ran {
 		t.Fatalf("err = %v, ran = %t", err, ran)
 	}
+
 	s := h.Stats()
 	if s.Denied != 1 || s.Admitted != 1 || s.Calls != 2 || s.Failures != 1 || s.InFlight != 0 {
 		t.Fatalf("stats = %+v", s)
 	}
+
 	if s.Admitted+s.Rejected+s.Shed+s.Denied != s.Calls {
 		t.Fatalf("invariant broken: %+v", s)
 	}
+
 	if !strings.Contains(s.String(), "denied=1") {
 		t.Fatalf("line = %q", s.String())
 	}
+
 	h.fail(t) // the denial did not reset the failure run: this is the second
 	h.wantState(t, Open)
 }
@@ -1980,6 +1993,7 @@ func TestErrorRateValidation(t *testing.T) {
 			t.Errorf("%s: New = %v, %v; want nil, ErrInvalidOption", tc.name, b, err)
 		}
 	}
+
 	// Every problem is reported at once.
 	_, err := New(t.Name(), WithErrorRate(0, 0, 0), WithErrorRateBuckets(2), WithFailureThreshold(0))
 	for _, want := range []string{"WithErrorRate(0, 0s, 0)", "WithErrorRateBuckets requires WithErrorRate", "WithFailureThreshold(0) requires WithErrorRate"} {
@@ -1987,6 +2001,7 @@ func TestErrorRateValidation(t *testing.T) {
 			t.Errorf("error %q does not mention %q", err, want)
 		}
 	}
+
 	good := [][]Option{
 		{WithErrorRate(1, time.Millisecond, 1)},
 		{WithErrorRate(0.5, 10, 1)}, // ten buckets of one nanosecond
@@ -2043,18 +2058,22 @@ func TestErrorRateBucketsAgeOutIndependentlyAtTheirOwnBoundaries(t *testing.T) {
 	if s := h.Stats(); s.WindowCalls != 10 || s.ErrorRate != 0.5 {
 		t.Fatalf("after 5 fails and 5 oks: %+v", s)
 	}
+
 	h.clock.Add(60 * time.Millisecond) // 9 buckets after the failures: still in
 	if s := h.Stats(); s.WindowCalls != 10 || s.ErrorRate != 0.5 {
 		t.Fatalf("at 90ms: %+v", s)
 	}
+
 	h.clock.Add(10 * time.Millisecond) // 10 buckets after the failures: gone
 	if s := h.Stats(); s.WindowCalls != 5 || s.ErrorRate != 0 {
 		t.Fatalf("at 100ms: %+v", s)
 	}
+
 	h.clock.Add(30 * time.Millisecond) // 10 buckets after the successes
 	if s := h.Stats(); s.WindowCalls != 0 || s.ErrorRate != 0 {
 		t.Fatalf("at 130ms: %+v", s)
 	}
+
 	h.fail(t) // the ring is usable after emptying
 	if s := h.Stats(); s.WindowCalls != 1 || s.ErrorRate != 1 {
 		t.Fatalf("after a fresh failure: %+v", s)
@@ -2085,10 +2104,12 @@ func TestBothRulesCoexist(t *testing.T) {
 	if s := h.Stats(); s.WindowCalls != 5 || s.ErrorRate != 1 {
 		t.Fatalf("after the consecutive trip: %+v", s)
 	}
+
 	h.clock.Add(time.Second)
 	h.ok(t)
 	h.ok(t)
 	h.wantState(t, Closed)
+
 	// Half the calls failing trips without five in a row.
 	for i := range 10 {
 		if i%2 == 0 {

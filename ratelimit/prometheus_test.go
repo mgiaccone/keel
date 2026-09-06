@@ -148,6 +148,7 @@ func TestKeysGaugeIsReadAtScrapeAndFollowsTheLimiter(t *testing.T) {
 		if got, ok := keysSeries(t, reg, name); !ok || got != 0 {
 			t.Fatalf("fresh limiter: keys = %v (present %v), want 0", got, ok)
 		}
+
 		for _, k := range []string{"a", "b", "c"} {
 			l.Allow(context.Background(), k)
 		}
@@ -155,8 +156,10 @@ func TestKeysGaugeIsReadAtScrapeAndFollowsTheLimiter(t *testing.T) {
 			t.Fatalf("keys = %v, want 3 at scrape without a decision in between", got)
 		}
 	}()
+
 	runtime.GC()
 	runtime.GC()
+
 	if got, ok := keysSeries(t, reg, name); ok {
 		t.Fatalf("a collected limiter still reports keys = %v", got)
 	}
