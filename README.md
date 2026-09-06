@@ -42,7 +42,7 @@ if errors.Is(err, breaker.ErrOpen) || errors.Is(err, breaker.ErrProbeLimit) || e
 store, err := ratelimit.NewMemoryStore()                          // or goredis.NewStore(client) for one quota fleet-wide
 limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)
 
-mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
+mux.Handle("/v1/", ratelimit.MustMiddleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
 ```
 
 ### Retrier

@@ -467,3 +467,32 @@ func TestTransportHedgeClosesTheLosingResponse(t *testing.T) {
 		t.Fatalf("the POST was hedged: %d hits, %+v", hits.Load(), h.Stats())
 	}
 }
+
+func TestTransportHedgeExhaustedResponseIsReadable(t *testing.T) {
+	// A retried response larger than the buffer limit stays open on its
+	// attempt's context. When that response is the one returned on
+	// exhaustion, its context must outlive the call or the body is
+	// unreadable; without hedging the attempt runs on the caller's context.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(w, strings.Repeat("x", 4*_bufferLimit))
+	}))
+	t.Cleanup(srv.Close)
+	h := newHedged(t, 5*time.Millisecond, false, WithMaxAttempts(2))
+	tr, err := NewTransport(h.Retrier, srv.Client().Transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := (&http.Client{Transport: tr}).Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	n, err := io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode != http.StatusServiceUnavailable || err != nil || n != 4*_bufferLimit {
+		t.Fatalf("status %d, read %d bytes, err %v", resp.StatusCode, n, err)
+	}
+	if s := h.Stats(); s.Exhausted != 1 || s.Attempts != 2 {
+		t.Fatalf("stats = %+v", s)
+	}
+}

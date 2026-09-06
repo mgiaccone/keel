@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -25,7 +26,7 @@ var ok = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.Write
 
 func TestMiddlewareAllowsThenLimitsWithHeaders(t *testing.T) {
 	h := newHarness(t, GCRA(1, 2))
-	mw := Middleware(h.Limiter, KeyByHeader("X-API-Key"))(ok)
+	mw := MustMiddleware(h.Limiter, KeyByHeader("X-API-Key"))(ok)
 	for i, wantRemaining := range []string{"1", "0"} {
 		rec := serve(mw, "acme")
 		if rec.Code != http.StatusNoContent || rec.Header().Get("X-RateLimit-Remaining") != wantRemaining {
@@ -43,7 +44,7 @@ func TestMiddlewareAllowsThenLimitsWithHeaders(t *testing.T) {
 
 func TestMiddlewareRetryAfterRoundsUp(t *testing.T) {
 	h := newHarness(t, GCRA(0.4, 1)) // one token every 2.5s
-	mw := Middleware(h.Limiter, KeyGlobal())(ok)
+	mw := MustMiddleware(h.Limiter, KeyGlobal())(ok)
 	serve(mw, "")
 	if rec := serve(mw, ""); rec.Header().Get("Retry-After") != "3" {
 		t.Fatalf("Retry-After = %q, want 3 (2.5s rounded up)", rec.Header().Get("Retry-After"))
@@ -74,11 +75,11 @@ func TestMiddlewareErrorPolicy(t *testing.T) {
 	failing := allowerFunc(func(context.Context, string) (Decision, error) { return Decision{}, boom })
 
 	var seen error
-	open := Middleware(failing, KeyGlobal(), OnError(func(_ *http.Request, err error) { seen = err }))(ok)
+	open := MustMiddleware(failing, KeyGlobal(), OnError(func(_ *http.Request, err error) { seen = err }))(ok)
 	if rec := serve(open, ""); rec.Code != http.StatusNoContent || !errors.Is(seen, boom) {
 		t.Fatalf("fail open: %d, seen %v", rec.Code, seen)
 	}
-	closed := Middleware(failing, KeyGlobal(), FailClosed())(ok)
+	closed := MustMiddleware(failing, KeyGlobal(), FailClosed())(ok)
 	if rec := serve(closed, ""); rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("fail closed: %d", rec.Code)
 	}
@@ -91,7 +92,7 @@ func TestMiddlewareCustomLimitedHandlerAndNoRemaining(t *testing.T) {
 		w.WriteHeader(http.StatusTooManyRequests)
 		w.Write([]byte(`{"error":"slow down"}`))
 	})
-	mw := Middleware(h.Limiter, KeyGlobal(), WithLimitedHandler(custom), WithoutRemainingHeader())(ok)
+	mw := MustMiddleware(h.Limiter, KeyGlobal(), WithLimitedHandler(custom), WithoutRemainingHeader())(ok)
 	if rec := serve(mw, ""); rec.Header().Get("X-RateLimit-Remaining") != "" {
 		t.Fatalf("remaining header present: %v", rec.Header())
 	}
@@ -99,4 +100,24 @@ func TestMiddlewareCustomLimitedHandlerAndNoRemaining(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Content-Type") != "application/json" || rec.Header().Get("Retry-After") == "" {
 		t.Fatalf("custom limited: %d %v", rec.Code, rec.Header())
 	}
+}
+
+func TestMiddlewareInvalidArguments(t *testing.T) {
+	// Every mistake is reported at bootstrap, not as a panic on the first
+	// request.
+	mw, err := Middleware(nil, nil, WithLimitedHandler(nil))
+	if mw != nil || !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("Middleware = non-nil %v, err %v", mw != nil, err)
+	}
+	for _, want := range []string{"limiter must not be nil", "key must not be nil", "WithLimitedHandler(nil)"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("MustMiddleware did not panic")
+		}
+	}()
+	MustMiddleware(nil, KeyGlobal())
 }

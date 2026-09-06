@@ -1,6 +1,8 @@
 package ratelimit
 
 import (
+	"errors"
+	"fmt"
 	"math"
 	"net"
 	"net/http"
@@ -34,8 +36,11 @@ func KeyByRemoteAddr() KeyFunc {
 // KeyGlobal keys every request the same, for one limit on the whole endpoint.
 func KeyGlobal() KeyFunc { return func(*http.Request) string { return "" } }
 
-// MiddlewareOption configures [Middleware].
-type MiddlewareOption func(*middlewareConfig)
+// MiddlewareOption configures [Middleware]. An option handed a value that
+// cannot be meant makes Middleware fail with an error wrapping
+// [ErrInvalidOption]; Middleware reports every invalid option, not just the
+// first.
+type MiddlewareOption func(*middlewareConfig) error
 
 type middlewareConfig struct {
 	limited   http.Handler
@@ -48,7 +53,13 @@ type middlewareConfig struct {
 // 429 Too Many Requests with a plain-text body; Retry-After and
 // X-RateLimit-Remaining are set before the handler runs either way.
 func WithLimitedHandler(h http.Handler) MiddlewareOption {
-	return func(c *middlewareConfig) { c.limited = h }
+	return func(c *middlewareConfig) error {
+		if h == nil {
+			return fmt.Errorf("%w: WithLimitedHandler(nil)", ErrInvalidOption)
+		}
+		c.limited = h
+		return nil
+	}
 }
 
 // FailClosed makes a limiter error refuse the request with 503 Service
@@ -56,19 +67,28 @@ func WithLimitedHandler(h http.Handler) MiddlewareOption {
 // because the limiter erring is only possible for a distributed limiter and
 // an API that goes down with its Redis is usually the worse outcome.
 func FailClosed() MiddlewareOption {
-	return func(c *middlewareConfig) { c.failOpen = false }
+	return func(c *middlewareConfig) error {
+		c.failOpen = false
+		return nil
+	}
 }
 
 // OnError is told about limiter errors, for logging; the limiter's own
-// metrics already count them.
+// metrics already count them. nil removes a previously set hook.
 func OnError(fn func(*http.Request, error)) MiddlewareOption {
-	return func(c *middlewareConfig) { c.onError = fn }
+	return func(c *middlewareConfig) error {
+		c.onError = fn
+		return nil
+	}
 }
 
 // WithoutRemainingHeader suppresses X-RateLimit-Remaining, for endpoints that
 // should not reveal their limits.
 func WithoutRemainingHeader() MiddlewareOption {
-	return func(c *middlewareConfig) { c.remaining = false }
+	return func(c *middlewareConfig) error {
+		c.remaining = false
+		return nil
+	}
 }
 
 func defaultLimited(w http.ResponseWriter, _ *http.Request) {
@@ -81,15 +101,33 @@ func defaultLimited(w http.ResponseWriter, _ *http.Request) {
 // composes with any router that accepts func(http.Handler) http.Handler.
 //
 //	limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)
-//	mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
-func Middleware(l Allower, key KeyFunc, opts ...MiddlewareOption) func(http.Handler) http.Handler {
+//	mw, err := ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))
+//	mux.Handle("/v1/", mw(api))
+//
+// If l or key is nil, or any option is invalid, Middleware returns an error
+// wrapping [ErrInvalidOption] that describes every problem, so a mistake
+// surfaces at bootstrap rather than as a panic on the first request.
+// [MustMiddleware] is the same for bootstrap code that treats it as fatal.
+func Middleware(l Allower, key KeyFunc, opts ...MiddlewareOption) (func(http.Handler) http.Handler, error) {
 	cfg := middlewareConfig{
 		limited:   http.HandlerFunc(defaultLimited),
 		failOpen:  true,
 		remaining: true,
 	}
+	var errs []error
+	if l == nil {
+		errs = append(errs, fmt.Errorf("%w: Middleware: limiter must not be nil", ErrInvalidOption))
+	}
+	if key == nil {
+		errs = append(errs, fmt.Errorf("%w: Middleware: key must not be nil", ErrInvalidOption))
+	}
 	for _, opt := range opts {
-		opt(&cfg)
+		if err := opt(&cfg); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -115,5 +153,15 @@ func Middleware(l Allower, key KeyFunc, opts ...MiddlewareOption) func(http.Hand
 			}
 			next.ServeHTTP(w, r)
 		})
+	}, nil
+}
+
+// MustMiddleware is [Middleware] for bootstrap code that treats an invalid
+// argument as fatal, mirroring [MustRegister]. It panics on error.
+func MustMiddleware(l Allower, key KeyFunc, opts ...MiddlewareOption) func(http.Handler) http.Handler {
+	mw, err := Middleware(l, key, opts...)
+	if err != nil {
+		panic(err)
 	}
+	return mw
 }

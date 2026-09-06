@@ -284,7 +284,9 @@ and set the cap at several times that.
 `WithAdaptiveInFlight(min, max, target)` moves the cap instead of fixing it:
 each successful call that completes within `target` raises it by one, each
 failure or slower call halves it, cancellations leave it unchanged, and it
-stays within [`min`, `max`]. The cap starts at `max`. This is additive
+stays within [`min`, `max`]. The time measured is `fn`'s own: it starts once
+the admission veto, if any, has returned, so a slow limiter never reads as a
+slow backend. The cap starts at `max`. This is additive
 increase, multiplicative decrease, the rule TCP uses for congestion control;
 its state is one integer and its history is visible on the
 `go_breaker_in_flight_limit` gauge. It needs enough calls to distinguish a

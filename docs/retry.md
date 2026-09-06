@@ -113,6 +113,9 @@ which is a requirement of the option. The rules:
    `Do` does not wait for them. Their results are discarded. The winner's
    context is left alive, since the value it produced may keep using it
    after `Do` returns, an HTTP body for one; it ends with the caller's.
+   The same holds for the attempt whose failure `Do` returns: what it
+   produced, a 503 with a body, is usable, and its context ends with the
+   caller's. Every other attempt's context ends with the call.
 4. A failure while other attempts are running is classified. Not retryable,
    or asking for a delay above `WithMaxRetryAfter`: the others are cancelled
    and the call is **aborted** with that error. The caller's context is done:
@@ -146,9 +149,10 @@ close response bodies the caller never sees. Without hedging, `Do` is the
 sequential loop above and allocates nothing on success.
 
 Hedge under a per-call context. Every attempt's context is derived from the
-caller's; the losers' end with the call, the winner's only with the
-caller's, so under a service-lifetime cancellable context each winner stays
-registered in it until it ends.
+caller's; the context of the attempt whose result `Do` returns, the winner
+or the last failure, ends only with the caller's, every other attempt's with
+the call, so under a service-lifetime cancellable context each returned
+attempt stays registered in it until it ends.
 
 ### Schedules
 
@@ -324,12 +328,21 @@ off), the cumulative counters `Calls`, `Attempts`, `Succeeded`, `Exhausted`,
 
 ```
 Succeeded + Exhausted + Aborted + Canceled + BudgetDenied == Calls
+```
+
+holds at every observation, and
+
+```
 Attempts >= Calls
 Hedged <= Attempts - Calls
 HedgeWon <= min(Hedged, Succeeded)
 ```
 
-hold at every observation. `Stats.String` renders one line:
+hold exactly for a retrier with no call in flight. The counters are
+independent atomics read one after another rather than a locked snapshot,
+the price of an attempt path with no lock, so with calls in flight each of
+the three may be off by the calls that ended while `Stats` was reading. A
+`Stats` line is a diagnostic, not a ledger. `Stats.String` renders one line:
 
 ```
 retry: name=catalogue backoff=exponential calls=812 attempts=901 ok=800 exhausted=5 aborted=7 canceled=0 budget=0 waited=1m2s hedged=40 hedge_won=31
@@ -478,7 +491,8 @@ nothing else. A chaos test with random latencies, outcomes and
 cancellations checks the `Stats` identities under the race detector. The
 transport is tested with a stalled first request, a hedge answering 503
 with a body too large to buffer, and the stalled request winning: the 503
-body must end up closed and the winner's open.
+body must end up closed and the winner's open. A second test exhausts the
+cap on such 503s and reads the returned body to the end.
 
 ## Benchmarks
 

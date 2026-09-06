@@ -70,8 +70,10 @@ so in the pull request and we will talk about it.
   return an error wrapping `ErrInvalidOption` that lists every such option,
   not only the first. Every tunable is an option with a default, never a
   fixed constant, and a rule can be switched off.
-- **No panics in library code.** Constructors return errors. The one
-  documented exception is `MustRegister`, mirroring Prometheus.
+- **No panics in library code.** Constructors return errors. The
+  documented exceptions are `MustRegister`, mirroring Prometheus, and
+  `ratelimit.MustMiddleware`; both are bootstrap conveniences that panic
+  only on an argument the plain form would reject.
 - **Time and randomness are injected.** `WithClock` and `WithSeed` exist so
   tests are deterministic; nothing reads `time.Now` or the global generator
   directly. The state machines use no timers.

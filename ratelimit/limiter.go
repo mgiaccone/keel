@@ -69,6 +69,9 @@ func New(name string, algorithm Algorithm, store Store, opts ...Option) (*Limite
 	}
 	l.metrics = newMetrics(name, algorithm.Name())
 	l.metrics.started()
+	if _, ok := store.(KeyCounter); ok {
+		_keys.add(l) // the keys gauge asks the store at scrape time
+	}
 	return l, nil
 }
 
@@ -110,9 +113,6 @@ func (l *Limiter) decided(d Decision) Decision {
 	} else {
 		l.limited.Add(1)
 		l.metrics.limited.Inc()
-	}
-	if kc, ok := l.store.(KeyCounter); ok {
-		l.metrics.keys.Set(float64(kc.Keys()))
 	}
 	return d
 }

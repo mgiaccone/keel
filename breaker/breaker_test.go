@@ -2221,3 +2221,39 @@ func TestObserverWindowEvents(t *testing.T) {
 		t.Fatalf("events around the close: %q", rec.events)
 	}
 }
+
+func TestAdmissionLatencyIsNotTheBackends(t *testing.T) {
+	// The veto may be a Redis round trip; its latency must not read as a slow
+	// backend to the adaptive bulkhead.
+	var h *harness
+	h = newHarness(t, WithAdaptiveInFlight(2, 8, 100*time.Millisecond), WithAdmission(func(context.Context) error {
+		h.clock.Add(200 * time.Millisecond)
+		return nil
+	}))
+	h.ok(t)
+	if s := h.Stats(); s.InFlightLimit != 8 {
+		t.Fatalf("a slow veto before an instant call moved the adaptive limit: %+v", s)
+	}
+}
+
+func TestErrorRateClockBeforeEpoch(t *testing.T) {
+	// A fake clock can start anywhere, the zero time included; the window
+	// must roll under a negative Unix time like any other.
+	clock := &fakeClock{}
+	clock.ns.Store(-int64(365 * 24 * time.Hour))
+	b, err := New(t.Name(), WithClock(clock.Now), WithFailureThreshold(0), WithErrorRate(0.5, 100*time.Millisecond, 100))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Stop()
+	for range 3 {
+		b.Do(t.Context(), func(context.Context) (int, error) { return 0, errBoom })
+	}
+	if s := b.Stats(); s.WindowCalls != 3 {
+		t.Fatalf("stats = %+v", s)
+	}
+	clock.Add(time.Hour)
+	if s := b.Stats(); s.WindowCalls != 0 || s.ErrorRate != 0 {
+		t.Fatalf("an hour later the window still holds outcomes: %+v", s)
+	}
+}

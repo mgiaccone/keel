@@ -20,11 +20,13 @@ type outcome[T any] struct {
 // the cap allows so no attempt ever blocks on it after the call has
 // returned. Nothing here needs locking beyond the RNG's.
 //
-// Every attempt runs on a context derived from the caller's. The losers are
-// cancelled when the call ends; the winner's context is left alive, since
-// the value it produced may keep using it after Do returns, an HTTP body for
-// one. It ends with the caller's context, which is why hedging wants a
-// per-call context rather than a service-lifetime one.
+// Every attempt runs on a context derived from the caller's. The attempt
+// whose result the call returns, the winner or the last failure, keeps its
+// context, since the value it produced may keep using it after Do returns,
+// an HTTP body for one; every other attempt's is cancelled when the call
+// ends, or when a later failure supersedes it. The kept context ends with the
+// caller's, which is why hedging wants a per-call context rather than a
+// service-lifetime one.
 func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T, error), discard func(T, error)) (T, error) {
 	var zero T
 	if ctx.Err() != nil {
@@ -83,13 +85,13 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 		go func() { ch <- r.cfg.sleep(tctx, r.cfg.hedge) }()
 	}
 	// leave ends the call: it stops the timer, cancels every attempt but the
-	// winner, and drains the results of the attempts still in flight, into
+	// one whose result is returned, and drains the results of the attempts still in flight, into
 	// the discard hook when there is one. A loser that panics after the call
 	// has returned panics there rather than being swallowed.
-	leave := func(winner int) {
+	leave := func(returned int) {
 		tcancel()
 		for i, c := range cancels {
-			if i+1 != winner {
+			if i+1 != returned {
 				c()
 			}
 		}
@@ -108,10 +110,13 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 		}
 	}
 	// supersede discards the pending failed result, which will not be
-	// returned.
+	// returned, and ends its attempt's context.
 	supersede := func() {
-		if pending != nil && discard != nil {
-			discard(pending.v, pending.err)
+		if pending != nil {
+			if discard != nil {
+				discard(pending.v, pending.err)
+			}
+			cancels[pending.attempt-1]()
 		}
 		pending = nil
 	}
@@ -140,13 +145,13 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 			supersede()
 			pending = &o
 			if ctx.Err() != nil {
-				leave(0)
+				leave(o.attempt)
 				r.end(Canceled, attempts)
 				return o.v, unwrapPermanent(o.err)
 			}
 			retryable, floor := r.classify(o.err)
 			if !retryable || floor > r.cfg.maxRetryAfter {
-				leave(0)
+				leave(o.attempt)
 				r.end(Aborted, attempts)
 				return o.v, unwrapPermanent(o.err)
 			}
@@ -154,7 +159,9 @@ func hedged[T any](r *Retrier, ctx context.Context, fn func(context.Context) (T,
 				continue // nothing starts because of a failure; the timer keeps running
 			}
 			// Every attempt has answered and failed: the ordinary retry path.
-			leave(0)
+			// The last failure's context stays alive until it is returned or
+			// superseded, so what it produced is usable either way.
+			leave(o.attempt)
 			switch {
 			case attempts >= r.cfg.maxAttempts:
 				r.end(Exhausted, attempts)

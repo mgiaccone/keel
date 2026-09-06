@@ -232,12 +232,13 @@ func WithMaxRetryAfter(d time.Duration) Option {
 // the caller's context ending, cancels the other attempts and ends the call
 // at once.
 //
-// Each attempt runs on a context derived from the caller's. The losers'
-// contexts end when the call does; the winner's is left alive, since the
-// value it produced may keep using it after Do returns, an HTTP body for
-// one, and it ends with the caller's. Hedge under a per-call context: under
-// a service-lifetime cancellable context, every winner's context stays
-// registered in it until it ends.
+// Each attempt runs on a context derived from the caller's. The context of
+// the attempt whose result Do returns, the winner or the last failure, is
+// left alive, since the value it produced may keep using it after Do
+// returns, an HTTP body for one, and it ends with the caller's; every other
+// attempt's ends when the call does. Hedge under a per-call context: under a
+// service-lifetime cancellable context, every returned attempt's context
+// stays registered in it until it ends.
 func WithHedge(after time.Duration) Option {
 	return func(c *config) error {
 		if after <= 0 {
@@ -550,10 +551,13 @@ func unwrapPermanent(err error) error {
 //
 //	Succeeded + Exhausted + Aborted + Canceled + BudgetDenied == Calls
 //
-// holds at every observation; Attempts >= Calls, since a call's attempts are
+// holds at every observation. Attempts >= Calls, since a call's attempts are
 // counted before it ends; Hedged <= Attempts - Calls, since a hedge is never
-// a first attempt; and HedgeWon <= min(Hedged, Succeeded). Every counter is
-// monotonic.
+// a first attempt; and HedgeWon <= min(Hedged, Succeeded). Those three hold
+// exactly for a retrier with no call in flight; the counters are independent
+// atomics read one after another, not a locked snapshot, so with calls in
+// flight each may be off by the calls that ended while Stats was reading.
+// Every counter is monotonic.
 type Stats struct {
 	// Name and Backoff identify the retrier.
 	Name, Backoff string

@@ -28,7 +28,7 @@ func Example_httpMiddleware() {
 	}
 
 	api := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
-	srv := httptest.NewServer(ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
+	srv := httptest.NewServer(ratelimit.MustMiddleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
 	defer srv.Close()
 
 	for i := range 4 {

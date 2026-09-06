@@ -5,10 +5,12 @@
 //	store := goredis.NewStore(client)
 //	limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)
 //
-// A key's record is a hash of its version and three state integers. Get is one
-// pipelined round trip (TIME and HMGET), so time comes from the Redis server
-// and skewed instance clocks agree; CompareAndSet is one Lua script run
-// atomically, sent as EVALSHA with an EVAL fallback. Records expire on the
+// A key's record is a hash of its version and three state integers. Get and
+// CompareAndSet are each one Lua script run atomically on the node that owns
+// the key, sent as EVALSHA with an EVAL fallback. Get reads the server's TIME
+// in the same script as the record, so time comes from the one Redis node
+// that holds the key: skewed instance clocks agree, and under Redis Cluster a
+// key is never timed by a node other than its owner. Records expire on the
 // algorithm's TTL. Requires Redis 5 or later, or Valkey.
 package goredis
 
@@ -31,6 +33,15 @@ type Store struct {
 }
 
 var _ ratelimit.Store = (*Store)(nil)
+
+// _get returns the node's TIME (seconds, microseconds) followed by the
+// record's four fields, absent ones as nil. Reading the clock in the script
+// pins it to the node that owns the key.
+var _get = redis.NewScript(`
+local t = redis.call('TIME')
+local f = redis.call('HMGET', KEYS[1], 'v', 'a', 'b', 'c')
+return {t[1], t[2], f[1], f[2], f[3], f[4]}
+`)
 
 // _cas writes the record if its version is still ARGV[1] ("0" = absent).
 // Redis hands the script every argument as a string; go-redis formats the
@@ -65,24 +76,32 @@ func NewStore(client redis.UniversalClient, opts ...Option) *Store {
 	return s
 }
 
-// Get implements [ratelimit.Store]. TIME and HMGET travel in one pipelined
-// round trip.
+// Get implements [ratelimit.Store]: one script run on the key's node returns
+// its clock and the record together.
 func (s *Store) Get(ctx context.Context, key string) (ratelimit.Record, time.Time, error) {
-	pipe := s.client.Pipeline()
-	serverTime := pipe.Time(ctx)
-	fields := pipe.HMGet(ctx, s.prefix+key, "v", "a", "b", "c")
-	if _, err := pipe.Exec(ctx); err != nil {
+	values, err := _get.Run(ctx, s.client, []string{s.prefix + key}).Slice()
+	if err != nil {
 		return ratelimit.Record{}, time.Time{}, err
 	}
-	now := serverTime.Val()
+	if len(values) != 6 {
+		return ratelimit.Record{}, time.Time{}, fmt.Errorf("goredis: %q: script returned %d values, want 6", key, len(values))
+	}
+	var secs, micros int64
+	if err := parseField(values[0], &secs); err != nil {
+		return ratelimit.Record{}, time.Time{}, fmt.Errorf("goredis: %q: TIME seconds: %w", key, err)
+	}
+	if err := parseField(values[1], &micros); err != nil {
+		return ratelimit.Record{}, time.Time{}, fmt.Errorf("goredis: %q: TIME microseconds: %w", key, err)
+	}
+	now := time.Unix(secs, micros*int64(time.Microsecond))
 
-	values := fields.Val()
-	if values[0] == nil {
+	fields := values[2:]
+	if fields[0] == nil {
 		return ratelimit.Record{}, now, nil
 	}
 	var version, a, b, c int64
 	for i, dst := range []*int64{&version, &a, &b, &c} {
-		if err := parseField(values[i], dst); err != nil {
+		if err := parseField(fields[i], dst); err != nil {
 			return ratelimit.Record{}, now, fmt.Errorf("goredis: %q field %d: %w", key, i, err)
 		}
 	}

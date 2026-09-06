@@ -35,7 +35,8 @@ type Record struct {
 }
 
 // KeyCounter is optionally implemented by stores that can say how many keys
-// they hold; the limiter reports it as Stats.Keys and a gauge.
+// they hold; the limiter reports it as Stats.Keys, and the keys gauge reads
+// it at scrape time.
 type KeyCounter interface {
 	Keys() int
 }
@@ -124,12 +125,8 @@ func (m *MemoryStore) Get(_ context.Context, key string) (Record, time.Time, err
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.records[key]
-	if !ok {
-		return Record{}, now, nil
-	}
-	if !r.expires.After(now) {
-		m.remove(r)
+	r := m.lookup(key, now)
+	if r == nil {
 		return Record{}, now, nil
 	}
 	m.lru.MoveToFront(r.elem)
@@ -141,30 +138,15 @@ func (m *MemoryStore) CompareAndSet(_ context.Context, key string, expect uint64
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.records[key]
-	if ok && !r.expires.After(now) {
-		m.remove(r)
-		r, ok = nil, false
-	}
+	r := m.lookup(key, now)
 	var current uint64
-	if ok {
+	if r != nil {
 		current = r.version
 	}
 	if current != expect {
 		return false, nil
 	}
-	m.version++
-	if !ok {
-		r = &memRecord{key: key}
-		r.elem = m.lru.PushFront(r)
-		m.records[key] = r
-		if m.lru.Len() > m.maxKeys {
-			m.remove(m.lru.Back().Value.(*memRecord))
-		}
-	} else {
-		m.lru.MoveToFront(r.elem)
-	}
-	r.state, r.version, r.expires = state, m.version, now.Add(ttl)
+	m.put(r, key, state, now.Add(ttl))
 	return true, nil
 }
 
@@ -174,24 +156,42 @@ func (m *MemoryStore) Update(_ context.Context, key string, algorithm Algorithm)
 	now := m.now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	r, ok := m.records[key]
-	if ok && !r.expires.After(now) {
-		m.remove(r)
-		r, ok = nil, false
-	}
+	r := m.lookup(key, now)
 	var current State
-	if ok {
+	if r != nil {
 		current = r.state
 	}
 	next, d := algorithm.Step(current, now)
 	if next == current {
-		if ok {
+		if r != nil {
 			m.lru.MoveToFront(r.elem)
 		}
 		return d, nil
 	}
-	m.version++
+	m.put(r, key, next, now.Add(algorithm.TTL()))
+	return d, nil
+}
+
+// lookup returns the key's live record, or nil, dropping it first if it has
+// expired. The caller holds the lock.
+func (m *MemoryStore) lookup(key string, now time.Time) *memRecord {
+	r, ok := m.records[key]
 	if !ok {
+		return nil
+	}
+	if !r.expires.After(now) {
+		m.remove(r)
+		return nil
+	}
+	return r
+}
+
+// put stamps state on r, or on a new record for key when r is nil, gives it
+// the next version, marks it most recently used and evicts past maxKeys. The
+// caller holds the lock.
+func (m *MemoryStore) put(r *memRecord, key string, state State, expires time.Time) {
+	m.version++
+	if r == nil {
 		r = &memRecord{key: key}
 		r.elem = m.lru.PushFront(r)
 		m.records[key] = r
@@ -201,8 +201,7 @@ func (m *MemoryStore) Update(_ context.Context, key string, algorithm Algorithm)
 	} else {
 		m.lru.MoveToFront(r.elem)
 	}
-	r.state, r.version, r.expires = next, m.version, now.Add(algorithm.TTL())
-	return d, nil
+	r.state, r.version, r.expires = state, m.version, expires
 }
 
 // Keys implements [KeyCounter].

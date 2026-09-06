@@ -12,7 +12,7 @@ limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   //
 
 // As middleware: allowed requests get X-RateLimit-Remaining; refused ones get
 // Retry-After and 429 Too Many Requests.
-mux.Handle("/v1/", ratelimit.Middleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
+mux.Handle("/v1/", ratelimit.MustMiddleware(limiter, ratelimit.KeyByHeader("X-API-Key"))(api))
 
 // Or directly.
 d, err := limiter.Allow(ctx, key)   // d.Allowed, d.Remaining, d.RetryAfter
@@ -111,7 +111,10 @@ Invalid arguments make `New` return an error wrapping `ErrInvalidOption`.
 ### Middleware
 
 `Middleware(limiter, key, opts...)` returns a `func(http.Handler)
-http.Handler`. `key` is a `KeyFunc`:
+http.Handler` and an error: a nil limiter or key, or an invalid option,
+comes back wrapping `ErrInvalidOption` at bootstrap rather than panicking on
+the first request. `MustMiddleware` is the same for bootstrap code that
+treats it as fatal, mirroring `MustRegister`. `key` is a `KeyFunc`:
 
 | Key function | Keys on |
 |---|---|
@@ -124,7 +127,7 @@ http.Handler`. `key` is a `KeyFunc`:
 |---|---|
 | `WithLimitedHandler(h)` | Serves refused requests instead of the default plain-text 429. `Retry-After` and `X-RateLimit-Remaining` are set before it runs. |
 | `FailClosed()` | Answers 503 when the limiter returns an error. The default lets the request through, on the grounds that a limiter that cannot decide, which only a distributed store can cause, should not take the API down with it. |
-| `OnError(fn)` | Receives limiter errors, for logging. |
+| `OnError(fn)` | Receives limiter errors, for logging. nil removes the hook. |
 | `WithoutRemainingHeader()` | Omits `X-RateLimit-Remaining`. |
 
 ## Behaviour
@@ -243,7 +246,7 @@ per-address keys would be unbounded cardinality.
 |---|---|---|
 | `go_ratelimit_decisions_total` | counter | `limiter`, `algorithm`, `result` ∈ allowed, limited, error |
 | `go_ratelimit_cas_conflicts_total` | counter | `limiter`, `algorithm` |
-| `go_ratelimit_keys` | gauge, when the store can report it | `limiter`, `algorithm` |
+| `go_ratelimit_keys` | gauge, read from the store at scrape time, when it can report it | `limiter`, `algorithm` |
 
 Common queries:
 
@@ -303,7 +306,7 @@ policies, and the breaker composition.
 | `Allow`, sliding window, allowed | 43 | 0 | 0 |
 | `Allow`, refused | 40 | 0 | 0 |
 | `Allow`, 4096 rotating keys | 102 | 128 | 2 |
-| `Allow`, GCRA, 18 goroutines on one key | 235 | 0 | 0 |
+| `Allow`, GCRA, 18 goroutines on one key | 162 | 0 | 0 |
 
 The three algorithms cost the same; the time is the map lookup and the mutex.
 The rotating-keys case allocates for new records as keys cycle past the

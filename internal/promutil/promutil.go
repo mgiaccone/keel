@@ -19,13 +19,18 @@ func ValidateNamespace(ns string) error {
 	return nil
 }
 
-// Register registers every collector with reg under namespace + "_". It
-// returns the first registration error, typically
-// prometheus.AlreadyRegisteredError on a duplicate.
+// Register registers every collector with reg under namespace + "_". It is
+// all or nothing: on the first registration error, typically
+// prometheus.AlreadyRegisteredError on a duplicate, the collectors already
+// registered by this call are unregistered again and the error is returned,
+// so a failed Register leaves reg as it found it.
 func Register(reg prometheus.Registerer, namespace string, collectors ...prometheus.Collector) error {
 	reg = prometheus.WrapRegistererWithPrefix(namespace+"_", reg)
-	for _, c := range collectors {
+	for i, c := range collectors {
 		if err := reg.Register(c); err != nil {
+			for _, done := range collectors[:i] {
+				reg.Unregister(done)
+			}
 			return err
 		}
 	}

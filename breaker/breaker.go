@@ -861,6 +861,7 @@ func (b *Breaker) Do[T any](ctx context.Context, fn func(context.Context) (T, er
 			out = _outcomeDenied
 			return zero, err
 		}
+		start = b.cfg.now() // the veto's latency is not the backend's
 	}
 	if b.cfg.timeout > 0 {
 		var cancel context.CancelFunc
@@ -1033,12 +1034,13 @@ type machine struct {
 // of that width since the Unix epoch, the newest at head. ok and fail are the
 // sums over the ring, so the rate costs nothing to read.
 type window struct {
-	width   time.Duration
-	buckets []bucket
-	head    int   // index of the newest bucket
-	slot    int64 // the newest bucket's slot: its start divided by width
-	ok      int
-	fail    int
+	width    time.Duration
+	buckets  []bucket
+	head     int   // index of the newest bucket
+	slot     int64 // the newest bucket's slot: its start divided by width
+	anchored bool  // slot is meaningful; false for a fresh or cleared ring
+	ok       int
+	fail     int
 }
 
 type bucket struct{ ok, fail int }
@@ -1049,10 +1051,15 @@ func newWindow(r *errorRate) *window {
 
 // rotate advances the ring to now, dropping buckets that have left the
 // window, and reports whether any outcome was dropped. A gap of a whole
-// window clears the ring; the zero slot of a fresh or cleared ring makes the
-// first rotation anchor it at now.
+// window clears the ring. The first rotation of a fresh or cleared ring
+// anchors it at now, whatever now is: no slot value is a sentinel, so a
+// clock before the epoch works like any other.
 func (w *window) rotate(now time.Time) bool {
 	slot := now.UnixNano() / int64(w.width)
+	if !w.anchored {
+		w.slot, w.anchored = slot, true
+		return false
+	}
 	k := slot - w.slot
 	if k <= 0 {
 		return false
@@ -1091,7 +1098,7 @@ func (w *window) record(now time.Time, failed bool) {
 
 func (w *window) reset() {
 	clear(w.buckets)
-	w.head, w.slot, w.ok, w.fail = 0, 0, 0, 0
+	w.head, w.slot, w.anchored, w.ok, w.fail = 0, 0, false, 0, 0
 }
 
 func (w *window) calls() int { return w.ok + w.fail }

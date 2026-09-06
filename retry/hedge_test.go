@@ -347,8 +347,10 @@ func TestHedgeCapBoundsHedgesAndRetriesTogether(t *testing.T) {
 	if s := h.Stats(); s.Attempts != 2 || s.Exhausted != 1 || len(h.recorded()) != 0 {
 		t.Fatalf("stats = %+v, waits = %v", s, h.recorded())
 	}
-	if !cancelled(g.ctx(1)) || !cancelled(g.ctx(2)) {
-		t.Fatal("attempt contexts outlived a call with no winner; they would stay registered in the caller's context")
+	// Whichever failure arrived last is the one returned; its context stays
+	// alive for what it produced, the other's ends with the call.
+	if cancelled(g.ctx(1)) == cancelled(g.ctx(2)) {
+		t.Fatalf("exactly one attempt context must outlive the call: 1 cancelled=%v, 2 cancelled=%v", cancelled(g.ctx(1)), cancelled(g.ctx(2)))
 	}
 }
 

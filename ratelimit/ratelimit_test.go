@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -571,8 +572,8 @@ func TestMetrics(t *testing.T) {
 	if got := series(_conflictsCounter, name, "gcra"); got != 0 {
 		t.Errorf("conflicts = %v, want 0", got)
 	}
-	if got := testutil.ToFloat64(_keysGauge.WithLabelValues(name, "gcra")); got != 2 {
-		t.Errorf("keys = %v, want 2", got)
+	if got, ok := keysSeries(t, reg, name); !ok || got != 2 {
+		t.Errorf("keys = %v (present %v), want 2", got, ok)
 	}
 	problems, err := testutil.GatherAndLint(reg)
 	if err != nil {
@@ -738,4 +739,58 @@ func BenchmarkAllowParallel(b *testing.B) {
 			l.Allow(ctx, "k")
 		}
 	})
+}
+
+// keysSeries gathers reg and returns the keys gauge for the limiter named
+// name, and whether that series was exposed at all.
+func keysSeries(t *testing.T, reg prometheus.Gatherer, name string) (float64, bool) {
+	t.Helper()
+	families, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range families {
+		if f.GetName() != "go_ratelimit_keys" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "limiter" && l.GetValue() == name {
+					return m.GetGauge().GetValue(), true
+				}
+			}
+		}
+	}
+	return 0, false
+}
+
+func TestKeysGaugeIsReadAtScrapeAndFollowsTheLimiter(t *testing.T) {
+	reg := prometheus.NewPedanticRegistry()
+	if err := Register(reg); err != nil {
+		t.Fatal(err)
+	}
+	name := uniqueName(t)
+	// The limiter is created and used in a function of its own, so that no
+	// reference to it survives on this frame once it returns.
+	func() {
+		store, _ := NewMemoryStore()
+		l, err := New(name, GCRA(1, 1), store)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := keysSeries(t, reg, name); !ok || got != 0 {
+			t.Fatalf("fresh limiter: keys = %v (present %v), want 0", got, ok)
+		}
+		for _, k := range []string{"a", "b", "c"} {
+			l.Allow(context.Background(), k)
+		}
+		if got, _ := keysSeries(t, reg, name); got != 3 {
+			t.Fatalf("keys = %v, want 3 at scrape without a decision in between", got)
+		}
+	}()
+	runtime.GC()
+	runtime.GC()
+	if got, ok := keysSeries(t, reg, name); ok {
+		t.Fatalf("a collected limiter still reports keys = %v", got)
+	}
 }
