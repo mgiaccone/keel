@@ -554,7 +554,8 @@ rule.
 
 Beyond one test per documented property, the suite has three layers:
 
-- **A reference model.** `TestModel` drives the breaker and an independent
+- **A reference model.** `TestStatsMatchAnIndependentReferenceModelStepByStep`
+  drives the breaker and an independent
   single-threaded implementation of the documented rules through the same
   random sequences of admissions, out-of-order settles, admission vetoes and
   clock advances, comparing `Stats` after every step. Half the seeds enable

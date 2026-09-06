@@ -11,17 +11,6 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    services:
-      valkey:
-        image: valkey/valkey:8-alpine
-        ports: ["6379:6379"]
-        options: >-
-          --health-cmd "valkey-cli ping"
-          --health-interval 2s
-          --health-timeout 2s
-          --health-retries 15
-    env:
-      REDIS_ADDR: 127.0.0.1:6379
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -29,6 +18,10 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      # ratelimit/redistore's tests start their own disposable Valkey
+      # container through testcontainers-go, the same as running make check
+      # locally; no services: block needed here.
+      #
       # The checks live in the Makefile so that `make check` locally is the
       # same run as this job. Add a check there, not here.
       - name: make check

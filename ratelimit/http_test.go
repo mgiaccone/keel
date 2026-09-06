@@ -55,18 +55,24 @@ func TestMiddlewareKeyFuncs(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.RemoteAddr = "203.0.113.7:51234"
 	req.Header.Set("X-API-Key", "k")
-	if got := KeyByRemoteAddr()(req); got != "203.0.113.7" {
-		t.Errorf("KeyByRemoteAddr = %q", got)
+	cases := []struct {
+		name   string
+		mutate func() // run before key, nil when the request needs no change
+		key    KeyFunc
+		want   string
+	}{
+		{"KeyByRemoteAddr", nil, KeyByRemoteAddr(), "203.0.113.7"},
+		{"KeyByRemoteAddr without port", func() { req.RemoteAddr = "no-port" }, KeyByRemoteAddr(), "no-port"},
+		{"KeyByHeader", nil, KeyByHeader("X-API-Key"), "k"},
+		{"KeyGlobal", nil, KeyGlobal(), ""},
 	}
-	req.RemoteAddr = "no-port"
-	if got := KeyByRemoteAddr()(req); got != "no-port" {
-		t.Errorf("KeyByRemoteAddr without port = %q", got)
-	}
-	if got := KeyByHeader("X-API-Key")(req); got != "k" {
-		t.Errorf("KeyByHeader = %q", got)
-	}
-	if got := KeyGlobal()(req); got != "" {
-		t.Errorf("KeyGlobal = %q", got)
+	for _, tc := range cases {
+		if tc.mutate != nil {
+			tc.mutate()
+		}
+		if got := tc.key(req); got != tc.want {
+			t.Errorf("%s = %q", tc.name, got)
+		}
 	}
 }
 

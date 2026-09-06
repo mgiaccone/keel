@@ -32,9 +32,11 @@ make test     # the quick suite
 ```
 
 The Redis store tests need a server: set `REDIS_ADDR`, or have Docker
-running and `make test-redis` starts a disposable Valkey container and
-removes it afterwards. They skip when neither is available, so the rest of
-the suite does not depend on Redis.
+running and `make test-redis` starts a disposable Valkey container through
+testcontainers-go and removes it afterwards. They skip when neither is
+available, so the rest of the suite does not depend on Redis. CI takes the
+same path as local `make check` — there is no separate service container to
+keep in sync.
 
 ## Before you open a pull request
 
@@ -79,7 +81,7 @@ so in the pull request and we will talk about it.
   directly. The state machines use no timers.
 - **Standard library only in the cores.** The third-party dependencies are
   `prometheus/client_golang` for metrics and `redis/go-redis`, linked only by
-  programs that import `ratelimit/goredis`. Keep it that way.
+  programs that import `ratelimit/redistore`. Keep it that way.
 - **Packages do not import each other.** They compose through small
   contracts: a `func(context.Context) error` seam, or an error that answers
   `Retryable() bool`. A new package follows the same rule.

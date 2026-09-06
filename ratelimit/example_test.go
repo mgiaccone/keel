@@ -16,9 +16,9 @@ import (
 // involved. A refusal is 429: the client exceeded a quota that is theirs.
 func Example_httpMiddleware() {
 	// Per API key: one request per second on average, bursts of 3 (small so
-	// the example is short). Swap the store for goredis.NewStore and the same
+	// the example is short). Swap the store for redistore.NewStore and the same
 	// middleware enforces one quota across every instance.
-	store, err := ratelimit.NewMemoryStore() // or goredis.NewStore(client) for one quota across the fleet
+	store, err := ratelimit.NewMemoryStore() // or redistore.NewStore(client) for one quota across the fleet
 	if err != nil {
 		panic(err) // example only
 	}

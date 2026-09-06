@@ -1,13 +1,13 @@
 # Rate Limiter
 
 Package `github.com/mgiaccone/keel/ratelimit`, with a Redis store in
-`github.com/mgiaccone/keel/ratelimit/goredis`. A keyed rate limiter built from
+`github.com/mgiaccone/keel/ratelimit/redistore`. A keyed rate limiter built from
 an algorithm applied to records in a store, with a `net/http` middleware.
 
 ## Quick start
 
 ```go
-store, err := ratelimit.NewMemoryStore()      // per process; goredis.NewStore(client) for one quota across instances
+store, err := ratelimit.NewMemoryStore()      // per process; redistore.NewStore(client) for one quota across instances
 limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)   // 100 per second per key, bursts of 20
 
 // As middleware: allowed requests get X-RateLimit-Remaining; refused ones get
@@ -94,12 +94,12 @@ calls, falls below the limit.
 | Constructor | Scope | Options |
 |---|---|---|
 | `NewMemoryStore(opts...)` | one process | `WithMaxKeys(n)`, default 1024: records kept, least recently used evicted beyond it. `WithClock(fn)`, default `time.Now`. |
-| `goredis.NewStore(client, opts...)` | shared through Redis | `WithKeyPrefix(p)`, default `ratelimit:`; include a hash tag such as `ratelimit:{public-api}:` to keep a limiter's keys in one cluster slot. |
+| `redistore.NewStore(client, opts...)` | shared through Redis | `WithKeyPrefix(p)`, default `ratelimit:`; include a hash tag such as `ratelimit:{public-api}:` to keep a limiter's keys in one cluster slot. |
 
 An evicted or expired key returns as if never seen, which for every algorithm
 means a full allowance. The Redis store requires Redis 5 or later, or Valkey.
 The `ratelimit` package does not import a Redis client; only programs that
-import `ratelimit/goredis` link go-redis.
+import `ratelimit/redistore` link go-redis.
 
 ### Limiter
 
@@ -231,7 +231,7 @@ See [`retry`](retry.md).
 ### With your own store or algorithm
 
 Implement `Store` (`Get` and `CompareAndSet`, optionally `Updater` and
-`KeyCounter`) for another backend, and run `storetest.Run` from its tests to
+`KeyCounter`) for another backend, and run `ratelimitstore.Run` from its tests to
 check the contract: absent keys, versioned updates, expiry and lost-update
 freedom under concurrent writers. Implement `Algorithm` (`Name`, `Validate`,
 `TTL`, `Step`) for another rule; it must be a pure function of the state and
@@ -288,13 +288,15 @@ provided as a starting point.
 
 Algorithms are tested as pure functions with explicit times, covering each
 rule, its `RetryAfter`, the fixed window's boundary burst and the sliding
-window's absence of one. Stores run the contract in `ratelimit/storetest`:
+window's absence of one. Stores run the contract in `conformance/ratelimitstore`:
 absent keys, versioned create and update, expiry, forward-moving time, and
 lost-update freedom under sixteen concurrent writers. The Redis store runs
 the contract and the algorithms against a real server: `REDIS_ADDR` if set,
-otherwise a disposable `valkey/valkey:8-alpine` container started with the
-`docker` CLI (`RATELIMIT_TEST_IMAGE` overrides the image) and removed
-afterwards; skipped when Docker is unavailable. The limiter's own tests
+otherwise a disposable `valkey/valkey:8-alpine` container started through
+testcontainers-go (`RATELIMIT_TEST_IMAGE` overrides the image) and terminated
+afterwards; skipped when Docker is unavailable. CI takes this same path,
+rather than a separate service container, so there is one mechanism to keep
+working, not two. The limiter's own tests
 cover the compare-and-set retry path under contention with a store that
 hides its `Updater`, error propagation, the middleware's headers and
 policies, and the breaker composition.

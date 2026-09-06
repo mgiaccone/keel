@@ -31,8 +31,8 @@ test: ## Quick run: -short trims the model and chaos iterations
 test-race: ## The full suite with the race detector on 1, 2 and 4 CPUs, twice
 	$(GO) test -race -cpu 1,2,4 -count=2 -timeout 15m ./...
 
-test-redis: ## The Redis store against a server: REDIS_ADDR, or a Valkey container via docker
-	$(GO) test -v ./ratelimit/goredis/
+test-redis: ## The Redis store against a server: REDIS_ADDR, or a disposable Valkey container via testcontainers-go
+	$(GO) test -v ./ratelimit/redistore/
 
 bench: ## Benchmarks with allocations; the source of the tables in docs/
 	$(GO) test -run '^$$' -bench . -benchmem $(BENCH_PKGS)

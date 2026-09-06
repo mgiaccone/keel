@@ -15,6 +15,16 @@ import (
 	"time"
 )
 
+// must fails the test now if err is not nil. It exists so the constructors
+// this suite calls constantly don't each need a three-line
+// if err != nil { t.Fatal(err) } beside them.
+func must(t testing.TB, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // fakeClock is the only synchronisation primitive in the test suite. It lives
 // here, not in the breaker: the breaker only ever calls Now().
 type fakeClock struct{ ns atomic.Int64 }
@@ -32,9 +42,7 @@ var errBoom = errors.New("boom")
 
 func TestMinimalRoundTrip(t *testing.T) {
 	b, err := New(t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	defer b.Stop()
 	v, err := b.Do(t.Context(), func(context.Context) (int, error) { return 42, nil })
 	if err != nil || v != 42 {
@@ -69,9 +77,7 @@ func newNamedHarness(t *testing.T, name string, opts ...Option) *harness {
 		WithOpenInterval(time.Second, 8*time.Second),
 	}
 	b, err := New(name, append(base, opts...)...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	t.Cleanup(b.Stop)
 	return &harness{Breaker: b, clock: clock}
 }
@@ -245,33 +251,31 @@ func TestMaxProbesEnforced(t *testing.T) {
 }
 
 func TestOpenIntervalGrowsExponentiallyAndCaps(t *testing.T) {
-	h := newHarness(t, WithFailureThreshold(1), WithOpenInterval(time.Second, 8*time.Second))
-	var got []time.Duration
-	for range 6 {
-		h.fail(t) // trips (first from closed, then from each half-open probe)
-		s := h.Stats()
-		got = append(got, s.NextProbeIn)
-		h.clock.Add(s.NextProbeIn)
-		h.wantState(t, HalfOpen)
+	cases := []struct {
+		name      string
+		base, max time.Duration
+		want      []time.Duration
+	}{
+		{"power of two", time.Second, 8 * time.Second,
+			[]time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second, 8 * time.Second}},
+		{"non-power of two", 3 * time.Second, 8 * time.Second,
+			[]time.Duration{3 * time.Second, 6 * time.Second, 8 * time.Second}},
 	}
-	want := []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 8 * time.Second, 8 * time.Second}
-	if !slices.Equal(got, want) {
-		t.Fatalf("intervals = %v, want %v", got, want)
-	}
-}
-
-func TestOpenIntervalCapsOnNonPowerOfTwo(t *testing.T) {
-	h := newHarness(t, WithFailureThreshold(1), WithOpenInterval(3*time.Second, 8*time.Second))
-	var got []time.Duration
-	for range 3 {
-		h.fail(t)
-		s := h.Stats()
-		got = append(got, s.NextProbeIn)
-		h.clock.Add(s.NextProbeIn)
-	}
-	want := []time.Duration{3 * time.Second, 6 * time.Second, 8 * time.Second}
-	if !slices.Equal(got, want) {
-		t.Fatalf("intervals = %v, want %v", got, want)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, WithFailureThreshold(1), WithOpenInterval(tc.base, tc.max))
+			var got []time.Duration
+			for range len(tc.want) {
+				h.fail(t) // trips (first from closed, then from each half-open probe)
+				s := h.Stats()
+				got = append(got, s.NextProbeIn)
+				h.clock.Add(s.NextProbeIn)
+				h.wantState(t, HalfOpen)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("intervals = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -384,9 +388,10 @@ func TestDeadlineExceededIsAFailureByDefault(t *testing.T) {
 	h.wantState(t, Open)
 }
 
-// TestStaleOutcomeIsIgnored: a slow call admitted while closed must not close
-// a circuit that tripped underneath it, however successful it turns out.
-func TestStaleOutcomeIsIgnored(t *testing.T) {
+// TestStaleOutcomeDoesNotCloseOrFreeAProbeSlot: a slow call admitted while
+// closed must not close a circuit that tripped underneath it, however
+// successful it turns out.
+func TestStaleOutcomeDoesNotCloseOrFreeAProbeSlot(t *testing.T) {
 	h := newHarness(t, WithFailureThreshold(2))
 
 	entered := make(chan struct{})
@@ -513,9 +518,7 @@ func TestCanceledContextDuringAcquire(t *testing.T) {
 
 func TestStopIsIdempotentAndConcurrent(t *testing.T) {
 	b, err := New(t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	var wg sync.WaitGroup
 	for range 10 {
 		wg.Go(b.Stop)
@@ -534,9 +537,7 @@ func TestStopIsIdempotentAndConcurrent(t *testing.T) {
 
 func TestStopLetsInFlightCallsFinish(t *testing.T) {
 	b, err := New(t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	entered := make(chan struct{})
 	finish := make(chan struct{})
 	done := make(chan error, 1)
@@ -580,7 +581,7 @@ func TestPanicInFnReleasesProbeSlot(t *testing.T) {
 	}
 }
 
-func TestStatsString(t *testing.T) {
+func TestStatsStringShowsStateTripsCallsAndProbeCountdown(t *testing.T) {
 	h := newHarness(t, WithFailureThreshold(1), WithOpenInterval(23*time.Second, time.Minute))
 	h.trip(t)
 	h.fail(t) // rejected
@@ -620,9 +621,7 @@ func TestStateString(t *testing.T) {
 
 func TestDefaults(t *testing.T) {
 	b, err := New(t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	defer b.Stop()
 	got := b.cfg
 	if got.failureThreshold != 5 || got.successThreshold != 2 || got.maxProbes != 1 ||
@@ -635,7 +634,7 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
-func TestInvalidOptionsAreReported(t *testing.T) {
+func TestEachInvalidOptionAloneFailsValidation(t *testing.T) {
 	cases := map[string]Option{
 		"WithFailureThreshold(0)":  WithFailureThreshold(0),
 		"WithSuccessThreshold(-1)": WithSuccessThreshold(-1),
@@ -658,7 +657,7 @@ func TestInvalidOptionsAreReported(t *testing.T) {
 	}
 }
 
-func TestNewReportsEveryInvalidOption(t *testing.T) {
+func TestCombinedErrorNamesEveryBadOptionAndOmitsGoodOnes(t *testing.T) {
 	_, err := New("x", WithFailureThreshold(0), WithMaxProbes(0), WithSuccessThreshold(3))
 	if !errors.Is(err, ErrInvalidOption) {
 		t.Fatalf("err = %v", err)
@@ -775,7 +774,7 @@ func TestObserverEventSequence(t *testing.T) {
 	}
 }
 
-func TestObserverSeesStaleOutcomes(t *testing.T) {
+func TestObserverIsToldAboutAStaleOutcomeEvenThoughItDoesNotCount(t *testing.T) {
 	rec := &recorder{}
 	h := newHarness(t, WithFailureThreshold(1), WithObserver(rec))
 	entered, finish, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
@@ -1281,7 +1280,8 @@ func TestClockAdvanceRightAfterDo(t *testing.T) {
 
 // refModel is an independent, single-threaded reference implementation of
 // the breaker's contract. It is deliberately written from the documentation
-// rather than from breaker.go, so that TestModel compares two formulations of
+// rather than from breaker.go, so that
+// TestStatsMatchAnIndependentReferenceModelStepByStep compares two formulations of
 // the same rules rather than the code against itself. Jitter is off because
 // the model cannot predict a random draw.
 type refModel struct {
@@ -1509,10 +1509,11 @@ func outcomeErr(out outcome) error {
 	return nil
 }
 
-// TestModel drives the breaker and the reference model with the same random
-// sequence of admissions, out-of-order settles and clock advances, and
-// compares Stats after every step. Failures print the seed to reproduce.
-func TestModel(t *testing.T) {
+// TestStatsMatchAnIndependentReferenceModelStepByStep drives the breaker and
+// the reference model with the same random sequence of admissions,
+// out-of-order settles and clock advances, and compares Stats after every
+// step. Failures print the seed to reproduce.
+func TestStatsMatchAnIndependentReferenceModelStepByStep(t *testing.T) {
 	seeds, steps := 40, 400
 	if testing.Short() {
 		seeds, steps = 8, 200
@@ -1819,9 +1820,7 @@ func createAndDrop(t *testing.T, n int) {
 	t.Helper()
 	for range n {
 		b, err := New("dropped")
-		if err != nil {
-			t.Fatal(err)
-		}
+		must(t, err)
 		b.Do(context.Background(), func(context.Context) (int, error) { return 1, nil })
 	}
 }
@@ -2029,10 +2028,10 @@ func TestErrorRateTripsPastMinCalls(t *testing.T) {
 	}
 }
 
-// TestErrorRateRotation: outcomes leave the window bucket by bucket as the
-// clock advances, without any traffic. The fake clock starts on a bucket
-// boundary, so the arithmetic below is exact.
-func TestErrorRateRotation(t *testing.T) {
+// TestErrorRateBucketsAgeOutIndependentlyAtTheirOwnBoundaries: outcomes leave
+// the window bucket by bucket as the clock advances, without any traffic. The
+// fake clock starts on a bucket boundary, so the arithmetic below is exact.
+func TestErrorRateBucketsAgeOutIndependentlyAtTheirOwnBoundaries(t *testing.T) {
 	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, 100*time.Millisecond, 100))
 	for range 5 {
 		h.fail(t)
@@ -2160,7 +2159,7 @@ func TestErrorRateClearsOnClose(t *testing.T) {
 	h.wantState(t, Open)
 }
 
-func TestErrorRateDecaysWithoutTraffic(t *testing.T) {
+func TestErrorRateWindowStaysFullUntilExactlyOneWindowElapses(t *testing.T) {
 	h := newHarness(t, WithFailureThreshold(100), WithErrorRate(0.5, 100*time.Millisecond, 100))
 	for range 4 {
 		h.fail(t)
@@ -2242,9 +2241,7 @@ func TestErrorRateClockBeforeEpoch(t *testing.T) {
 	clock := &fakeClock{}
 	clock.ns.Store(-int64(365 * 24 * time.Hour))
 	b, err := New(t.Name(), WithClock(clock.Now), WithFailureThreshold(0), WithErrorRate(0.5, 100*time.Millisecond, 100))
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	defer b.Stop()
 	for range 3 {
 		b.Do(t.Context(), func(context.Context) (int, error) { return 0, errBoom })

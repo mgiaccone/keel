@@ -33,9 +33,7 @@ func registry(t *testing.T) *prometheus.Registry {
 func compareSeries(t *testing.T, reg prometheus.Gatherer, dependency, want string, names ...string) {
 	t.Helper()
 	families, err := reg.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	var kept []*dto.MetricFamily
 	for _, f := range families {
 		if len(names) > 0 && !slices.Contains(names, f.GetName()) {
@@ -70,9 +68,7 @@ func compareSeries(t *testing.T, reg prometheus.Gatherer, dependency, want strin
 func countSeries(t *testing.T, reg prometheus.Gatherer, name, dependency string) int {
 	t.Helper()
 	families, err := reg.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	n := 0
 	for _, f := range families {
 		if f.GetName() != name {
@@ -139,9 +135,7 @@ func TestMetricsLint(t *testing.T) {
 	reg := registry(t)
 	newHarness(t)
 	problems, err := testutil.GatherAndLint(reg)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	for _, p := range problems {
 		t.Errorf("lint: %s: %s", p.Metric, p.Text)
 	}

@@ -1,10 +1,10 @@
-// Package storetest is the contract every [ratelimit.Store] must satisfy. A
-// store implementation runs it from its own tests:
+// Package ratelimitstore is the contract every [ratelimit.Store] must
+// satisfy. A store implementation runs it from its own tests:
 //
 //	func TestStore(t *testing.T) {
-//		storetest.Run(t, func(t *testing.T) ratelimit.Store { return newStoreForTest(t) })
+//		ratelimitstore.Run(t, func(t *testing.T) ratelimit.Store { return newStoreForTest(t) })
 //	}
-package storetest
+package ratelimitstore
 
 import (
 	"context"

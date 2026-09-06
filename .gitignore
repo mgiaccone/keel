@@ -1,3 +1,8 @@
 .idea/
 *.test
 *.out
+
+# Claude Code runtime state (session locks, local settings, caches) —
+# everything under .claude/ is ignored except the project instructions.
+.claude/*
+!.claude/CLAUDE.md

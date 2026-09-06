@@ -1,8 +1,8 @@
-// Package goredis is a [ratelimit.Store] backed by Redis through go-redis, so
-// one limit is shared across every instance of a service.
+// Package redistore is a [ratelimit.Store] backed by Redis through go-redis,
+// so one limit is shared across every instance of a service.
 //
 //	client := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-//	store := goredis.NewStore(client)
+//	store, err := redistore.NewStore(client)
 //	limiter, err := ratelimit.New("public-api", ratelimit.GCRA(100, 20), store)
 //
 // A key's record is a hash of its version and three state integers. Get and
@@ -12,7 +12,7 @@
 // that holds the key: skewed instance clocks agree, and under Redis Cluster a
 // key is never timed by a node other than its owner. Records expire on the
 // algorithm's TTL. Requires Redis 5 or later, or Valkey.
-package goredis
+package redistore
 
 import (
 	"context"
@@ -25,6 +25,10 @@ import (
 
 	"github.com/mgiaccone/keel/ratelimit"
 )
+
+// ErrInvalidOption is wrapped by every error [NewStore] returns for an
+// argument or option value that cannot be meant.
+var ErrInvalidOption = errors.New("redistore: invalid option")
 
 // Store implements [ratelimit.Store] on a go-redis client.
 type Store struct {
@@ -56,24 +60,46 @@ redis.call('PEXPIRE', KEYS[1], ARGV[5])
 return 1
 `)
 
-// Option configures a [Store].
-type Option func(*Store)
+// Option configures a [Store]. An option given a value that cannot be meant
+// makes [NewStore] return an error wrapping [ErrInvalidOption]; NewStore
+// reports every invalid option, not just the first.
+type Option func(*Store) error
 
 // WithKeyPrefix sets the prefix of every Redis key; default "ratelimit:". To
 // pin all of a limiter's keys to one Redis Cluster slot, include a hash tag:
 // "ratelimit:{public-api}:".
 func WithKeyPrefix(prefix string) Option {
-	return func(s *Store) { s.prefix = prefix }
+	return func(s *Store) error {
+		s.prefix = prefix
+		return nil
+	}
 }
 
 // NewStore returns a store on client, which may be a single-node, Cluster or
-// Sentinel client.
-func NewStore(client redis.UniversalClient, opts ...Option) *Store {
+// Sentinel client. It is deliberately built on a client the caller
+// constructs and owns, rather than connection parameters this package would
+// turn into one itself: a client is usually shared with the rest of the
+// service, carries whichever of go-redis's TLS, auth, pool and topology
+// settings the deployment needs, and its teardown belongs to whoever created
+// it.
+//
+// If client is nil, or any option is invalid, NewStore returns an error
+// wrapping [ErrInvalidOption] that describes every problem.
+func NewStore(client redis.UniversalClient, opts ...Option) (*Store, error) {
 	s := &Store{client: client, prefix: "ratelimit:"}
-	for _, opt := range opts {
-		opt(s)
+	var errs []error
+	if client == nil {
+		errs = append(errs, fmt.Errorf("%w: NewStore: client must not be nil", ErrInvalidOption))
 	}
-	return s
+	for _, opt := range opts {
+		if err := opt(s); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // Get implements [ratelimit.Store]: one script run on the key's node returns
@@ -84,14 +110,14 @@ func (s *Store) Get(ctx context.Context, key string) (ratelimit.Record, time.Tim
 		return ratelimit.Record{}, time.Time{}, err
 	}
 	if len(values) != 6 {
-		return ratelimit.Record{}, time.Time{}, fmt.Errorf("goredis: %q: script returned %d values, want 6", key, len(values))
+		return ratelimit.Record{}, time.Time{}, fmt.Errorf("redistore: %q: script returned %d values, want 6", key, len(values))
 	}
 	var secs, micros int64
 	if err := parseField(values[0], &secs); err != nil {
-		return ratelimit.Record{}, time.Time{}, fmt.Errorf("goredis: %q: TIME seconds: %w", key, err)
+		return ratelimit.Record{}, time.Time{}, fmt.Errorf("redistore: %q: TIME seconds: %w", key, err)
 	}
 	if err := parseField(values[1], &micros); err != nil {
-		return ratelimit.Record{}, time.Time{}, fmt.Errorf("goredis: %q: TIME microseconds: %w", key, err)
+		return ratelimit.Record{}, time.Time{}, fmt.Errorf("redistore: %q: TIME microseconds: %w", key, err)
 	}
 	now := time.Unix(secs, micros*int64(time.Microsecond))
 
@@ -102,7 +128,7 @@ func (s *Store) Get(ctx context.Context, key string) (ratelimit.Record, time.Tim
 	var version, a, b, c int64
 	for i, dst := range []*int64{&version, &a, &b, &c} {
 		if err := parseField(fields[i], dst); err != nil {
-			return ratelimit.Record{}, now, fmt.Errorf("goredis: %q field %d: %w", key, i, err)
+			return ratelimit.Record{}, now, fmt.Errorf("redistore: %q field %d: %w", key, i, err)
 		}
 	}
 	return ratelimit.Record{Version: uint64(version), State: ratelimit.State{A: a, B: b, C: c}}, now, nil

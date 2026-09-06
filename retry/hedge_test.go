@@ -354,10 +354,11 @@ func TestHedgeCapBoundsHedgesAndRetriesTogether(t *testing.T) {
 	}
 }
 
-// TestLateLoserPanicIsNotSwallowed runs the scenario in a child process: a
-// loser that panics after the call has returned must crash the process, as
-// an unrecovered panic in fn would, not vanish into a channel nobody reads.
-func TestLateLoserPanicIsNotSwallowed(t *testing.T) {
+// TestLoserPanicAfterDoReturnsCrashesTheProcessInstead runs the scenario in a
+// child process: a loser that panics after the call has returned must crash
+// the process, as an unrecovered panic in fn would, not vanish into a channel
+// nobody reads.
+func TestLoserPanicAfterDoReturnsCrashesTheProcessInstead(t *testing.T) {
 	if os.Getenv("KEEL_RETRY_LATE_PANIC") == "1" {
 		r, err := New("late", Constant(0), WithMaxAttempts(2), WithHedge(time.Millisecond))
 		if err != nil {
@@ -374,7 +375,7 @@ func TestLateLoserPanicIsNotSwallowed(t *testing.T) {
 		time.Sleep(200 * time.Millisecond) // the loser panics on its own goroutine after Do returned
 		os.Exit(0)
 	}
-	cmd := exec.Command(os.Args[0], "-test.run=^TestLateLoserPanicIsNotSwallowed$")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLoserPanicAfterDoReturnsCrashesTheProcessInstead$")
 	cmd.Env = append(os.Environ(), "KEEL_RETRY_LATE_PANIC=1")
 	out, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(out), "late loser") {
@@ -421,7 +422,7 @@ func TestHedgeCallerCancels(t *testing.T) {
 	}
 }
 
-func TestHedgePanicPropagatesToTheCaller(t *testing.T) {
+func TestPanicInTheWinningAttemptPropagatesSynchronouslyFromDo(t *testing.T) {
 	h := newHedged(t, 5*time.Millisecond, true, WithMaxAttempts(2))
 	g := newGate(t)
 	panicked := make(chan any, 1)
@@ -503,8 +504,16 @@ func TestDiscardHookSeesOnlySupersededResults(t *testing.T) {
 	for len(discarded()) < 2 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if want := []seen{{0, errTransient}, {8, nil}}; !slices.Equal(discarded(), want) {
-		t.Fatalf("discarded %v, want %v", discarded(), want)
+	// The two losing results race to the discard hook: g.finish only unblocks
+	// the attempt goroutine, it does not wait for hedged to have processed
+	// the outcome, so the order the test calls g.finish in does not order
+	// what hedged sees. Nothing in hedged's contract orders two concurrently
+	// discarded results relative to each other either — only that each one
+	// is discarded exactly once — so this checks that, not a stricter
+	// ordering the test used to assume and that made it flaky.
+	got, want := discarded(), []seen{{0, errTransient}, {8, nil}}
+	if !slices.Equal(got, want) && !slices.Equal(got, []seen{want[1], want[0]}) {
+		t.Fatalf("discarded %v, want %v in either order", got, want)
 	}
 }
 

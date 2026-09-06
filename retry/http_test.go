@@ -63,25 +63,19 @@ func newTransport(t *testing.T, statuses []int, retrierOpts []Option, opts ...Tr
 	t.Cleanup(srv.Close)
 	h := newHarness(t, Constant(10*time.Millisecond), retrierOpts...)
 	tr, err := NewTransport(h.Retrier, srv.Client().Transport, opts...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	return &transportHarness{harness: h, srv: srv, script: sc, client: &http.Client{Transport: tr}}
 }
 
 func (th *transportHarness) do(t *testing.T, method string, body io.Reader, headers ...string) *http.Response {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), method, th.srv.URL, body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	for i := 0; i+1 < len(headers); i += 2 {
 		req.Header.Set(headers[i], headers[i+1])
 	}
 	resp, err := th.client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	t.Cleanup(func() { resp.Body.Close() })
 	return resp
 }
@@ -172,9 +166,7 @@ func TestTransportPassesThroughANonReplayableBody(t *testing.T) {
 	req, _ := http.NewRequestWithContext(t.Context(), http.MethodGet, th.srv.URL, nil)
 	req.Body = io.NopCloser(strings.NewReader("stream")) // GetBody stays nil: cannot be replayed
 	resp, err := th.client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	resp.Body.Close()
 	if resp.StatusCode != 503 || th.script.requests() != 1 {
 		t.Fatalf("status %d after %d requests", resp.StatusCode, th.script.requests())
@@ -185,29 +177,25 @@ func TestTransportPassesThroughANonReplayableBody(t *testing.T) {
 }
 
 func TestTransportHonoursRetryAfter(t *testing.T) {
-	th := newTransport(t, []int{429, 200}, nil)
-	th.script.headers = http.Header{"Retry-After": {"2"}}
-	th.do(t, http.MethodGet, nil)
-	if got := th.recorded(); len(got) != 1 || got[0] != 2*time.Second+10*time.Millisecond {
-		t.Fatalf("waits = %v, want 2s plus the schedule", got)
+	cases := []struct {
+		name   string
+		header func(clock *fakeClock) string // the fresh clock this case's transport gets
+		want   time.Duration
+	}{
+		{"seconds", func(*fakeClock) string { return "2" }, 2*time.Second + 10*time.Millisecond},
+		{"HTTP-date", func(c *fakeClock) string { return c.Now().Add(3 * time.Second).UTC().Format(http.TimeFormat) }, 3*time.Second + 10*time.Millisecond},
+		{"unparseable: no floor", func(*fakeClock) string { return "soon" }, 10 * time.Millisecond},
+		{"in the past: no floor", func(c *fakeClock) string { return c.Now().Add(-time.Minute).UTC().Format(http.TimeFormat) }, 10 * time.Millisecond},
 	}
-
-	th = newTransport(t, []int{503, 200}, nil)
-	at := th.clock.Now().Add(3 * time.Second)
-	th.script.headers = http.Header{"Retry-After": {at.UTC().Format(http.TimeFormat)}}
-	th.do(t, http.MethodGet, nil)
-	if got := th.recorded(); len(got) != 1 || got[0] != 3*time.Second+10*time.Millisecond {
-		t.Fatalf("waits = %v, want 3s from the HTTP-date plus the schedule", got)
-	}
-
-	// Unparseable, or in the past: no floor.
-	for _, v := range []string{"soon", th.clock.Now().Add(-time.Minute).UTC().Format(http.TimeFormat)} {
-		th = newTransport(t, []int{503, 200}, nil)
-		th.script.headers = http.Header{"Retry-After": {v}}
-		th.do(t, http.MethodGet, nil)
-		if got := th.recorded(); len(got) != 1 || got[0] != 10*time.Millisecond {
-			t.Fatalf("Retry-After %q: waits = %v", v, got)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			th := newTransport(t, []int{503, 200}, nil)
+			th.script.headers = http.Header{"Retry-After": {tc.header(th.clock)}}
+			th.do(t, http.MethodGet, nil)
+			if got := th.recorded(); len(got) != 1 || got[0] != tc.want {
+				t.Fatalf("waits = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -256,9 +244,7 @@ func TestTransportReleasesRetriedBodies(t *testing.T) {
 		th.script.body = strings.Repeat("x", size)
 		tracker := &closeTracker{next: th.srv.Client().Transport}
 		tr, err := NewTransport(th.Retrier, tracker)
-		if err != nil {
-			t.Fatal(err)
-		}
+		must(t, err)
 		th.client.Transport = tr
 		resp := th.do(t, http.MethodGet, nil)
 		body, _ := io.ReadAll(resp.Body)
@@ -314,17 +300,18 @@ func TestTransportRetriesTransportErrors(t *testing.T) {
 
 func TestTransportInvalidOptions(t *testing.T) {
 	h := newHarness(t, Constant(0))
-	if _, err := NewTransport(nil, nil); !errors.Is(err, ErrInvalidOption) {
-		t.Errorf("nil retrier: %v", err)
+	cases := map[string]func() (*Transport, error){
+		"nil retrier":   func() (*Transport, error) { return NewTransport(nil, nil) },
+		"no methods":    func() (*Transport, error) { return NewTransport(h.Retrier, nil, WithIdempotentMethods()) },
+		"empty method":  func() (*Transport, error) { return NewTransport(h.Retrier, nil, WithIdempotentMethods("")) },
+		"nil predicate": func() (*Transport, error) { return NewTransport(h.Retrier, nil, WithRetryResponse(nil)) },
 	}
-	if _, err := NewTransport(h.Retrier, nil, WithIdempotentMethods()); !errors.Is(err, ErrInvalidOption) {
-		t.Errorf("no methods: %v", err)
-	}
-	if _, err := NewTransport(h.Retrier, nil, WithIdempotentMethods("")); !errors.Is(err, ErrInvalidOption) {
-		t.Errorf("empty method: %v", err)
-	}
-	if _, err := NewTransport(h.Retrier, nil, WithRetryResponse(nil)); !errors.Is(err, ErrInvalidOption) {
-		t.Errorf("nil predicate: %v", err)
+	for name, mk := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := mk(); !errors.Is(err, ErrInvalidOption) {
+				t.Errorf("%v", err)
+			}
+		})
 	}
 	tr, err := NewTransport(h.Retrier, nil)
 	if err != nil || tr.next != http.DefaultTransport {
@@ -396,9 +383,7 @@ func TestTransportHedgeClosesTheLosingResponse(t *testing.T) {
 	h := newHedged(t, 5*time.Millisecond, true, WithMaxAttempts(2))
 	tracker := &closeTracker{next: srv.Client().Transport}
 	tr, err := NewTransport(h.Retrier, tracker)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	client := &http.Client{Transport: tr}
 
 	type result struct {
@@ -459,9 +444,7 @@ func TestTransportHedgeClosesTheLosingResponse(t *testing.T) {
 	}
 
 	resp, err := client.Post(srv.URL, "text/plain", strings.NewReader("body")) // replayable: GetBody is set, but POST is not in the method set
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	resp.Body.Close()
 	if hits.Load() != 3 || h.Stats().Calls != 1 {
 		t.Fatalf("the POST was hedged: %d hits, %+v", hits.Load(), h.Stats())
@@ -480,13 +463,9 @@ func TestTransportHedgeExhaustedResponseIsReadable(t *testing.T) {
 	t.Cleanup(srv.Close)
 	h := newHedged(t, 5*time.Millisecond, false, WithMaxAttempts(2))
 	tr, err := NewTransport(h.Retrier, srv.Client().Transport)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	resp, err := (&http.Client{Transport: tr}).Get(srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	defer resp.Body.Close()
 	n, err := io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusServiceUnavailable || err != nil || n != 4*_bufferLimit {

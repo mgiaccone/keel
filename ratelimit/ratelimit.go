@@ -15,7 +15,7 @@
 //
 // Algorithms are written once, in Go, and work against every store. Stores
 // know nothing about rates; they keep a few integers per key and swap them
-// atomically. [NewMemoryStore] is process-local; github.com/mgiaccone/keel/ratelimit/goredis
+// atomically. [NewMemoryStore] is process-local; github.com/mgiaccone/keel/ratelimit/redistore
 // shares one limit across a fleet through Redis. Adding an algorithm is one
 // pure function; adding a store is one Get and one CompareAndSet.
 //

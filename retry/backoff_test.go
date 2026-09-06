@@ -53,24 +53,25 @@ func TestExponentialSaturatesWithoutOverflow(t *testing.T) {
 
 func TestDecorrelatedDrawsFromBaseToTriplePrevious(t *testing.T) {
 	b := Decorrelated(100*time.Millisecond, time.Second)
-	if d := b.Delay(1, 0, 0); d != 100*time.Millisecond {
-		t.Fatalf("first, u=0: %s, want base", d)
+	cases := []struct {
+		name     string
+		retry    int
+		previous time.Duration
+		u        float64
+		want     time.Duration
+	}{
+		{"first, u=0", 1, 0, 0, 100 * time.Millisecond},                                   // want base
+		{"first, u=1", 1, 0, 1, 300 * time.Millisecond},                                   // want 3×base
+		{"previous 200ms, u=0.5", 2, 200 * time.Millisecond, 0.5, 350 * time.Millisecond}, // base + half of (600ms − base)
+		{"previous 500ms, u=1", 2, 500 * time.Millisecond, 1, time.Second},                // want max
+		// Under the floor, and past the cap, the draw is clamped.
+		{"previous below base", 2, 10 * time.Millisecond, 0, 100 * time.Millisecond},
+		{"previous above max", 2, time.Hour, 1, time.Second},
 	}
-	if d := b.Delay(1, 0, 1); d != 300*time.Millisecond {
-		t.Fatalf("first, u=1: %s, want 3×base", d)
-	}
-	if d := b.Delay(2, 200*time.Millisecond, 0.5); d != 350*time.Millisecond {
-		t.Fatalf("previous 200ms, u=0.5: %s, want base + half of (600ms − base)", d)
-	}
-	if d := b.Delay(2, 500*time.Millisecond, 1); d != time.Second {
-		t.Fatalf("previous 500ms, u=1: %s, want max", d)
-	}
-	// Under the floor, and past the cap, the draw is clamped.
-	if d := b.Delay(2, 10*time.Millisecond, 0); d != 100*time.Millisecond {
-		t.Fatalf("previous below base: %s", d)
-	}
-	if d := b.Delay(2, time.Hour, 1); d != time.Second {
-		t.Fatalf("previous above max: %s", d)
+	for _, tc := range cases {
+		if d := b.Delay(tc.retry, tc.previous, tc.u); d != tc.want {
+			t.Errorf("%s: %s, want %s", tc.name, d, tc.want)
+		}
 	}
 }
 

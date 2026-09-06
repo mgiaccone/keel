@@ -16,6 +16,16 @@ import (
 	"github.com/mgiaccone/keel/ratelimit"
 )
 
+// must fails the test now if err is not nil. It exists so the constructors
+// this suite calls constantly don't each need a three-line
+// if err != nil { t.Fatal(err) } beside them.
+func must(t testing.TB, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 var _nameSeq atomic.Uint64
 
 // uniqueName gives a retrier a name no other run in this process has used, so
@@ -84,9 +94,7 @@ func newHarness(t *testing.T, backoff Backoff, opts ...Option) *harness {
 		}),
 	}
 	r, err := New(uniqueName(t), backoff, append(base, opts...)...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	h.Retrier = r
 	return h
 }
@@ -521,9 +529,7 @@ func TestSeedMakesWaitsReproducible(t *testing.T) {
 
 func TestBreakerRefusalIsNotRetried(t *testing.T) {
 	b, err := breaker.New(uniqueName(t), breaker.WithFailureThreshold(1))
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	defer b.Stop()
 	b.Do(t.Context(), func(context.Context) (int, error) { return 0, errBoom }) // trips
 	h := newHarness(t, Constant(time.Millisecond), WithMaxAttempts(5))
@@ -543,9 +549,7 @@ func TestLimiterRefusalIsWaitedFor(t *testing.T) {
 	clock := newFakeClock()
 	store, _ := ratelimit.NewMemoryStore(ratelimit.WithClock(clock.Now))
 	limiter, err := ratelimit.New(uniqueName(t), ratelimit.GCRA(1, 1), store)
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	admit := ratelimit.AdmissionGlobal(limiter)
 	h := newHarness(t, Constant(10*time.Millisecond), WithMaxAttempts(2))
 	fn := func(ctx context.Context) (int, error) {
@@ -572,9 +576,7 @@ func TestLimiterRefusalIsWaitedFor(t *testing.T) {
 func TestLimiterAsBudget(t *testing.T) {
 	store, _ := ratelimit.NewMemoryStore()
 	limiter, err := ratelimit.New(uniqueName(t), ratelimit.GCRA(1e-3, 2), store) // two retries, then nothing for a long time
-	if err != nil {
-		t.Fatal(err)
-	}
+	must(t, err)
 	h := newHarness(t, Constant(time.Millisecond), WithMaxAttempts(10), WithBudget(ratelimit.AdmissionGlobal(limiter)))
 	_, err = h.Do(t.Context(), failing(10, errBoom, 1))
 	if err != errBoom {
