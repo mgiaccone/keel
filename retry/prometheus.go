@@ -16,14 +16,14 @@ const (
 )
 
 // The package's metrics. Every retrier updates them from the calling
-// goroutine whether or not they are registered; [Register] publishes them
+// goroutine whether they are registered; [Register] publishes them
 // under a namespace it prepends. With the default namespace "go":
 //
-//	go_retry_calls_total{retrier,backoff,result="success|exhausted|aborted|canceled|budget"}  counter
-//	go_retry_attempts_total{retrier,backoff}                                                     counter, first attempts included
-//	go_retry_wait_seconds_total{retrier,backoff}                                                 counter, time asked to wait
-//	go_retry_hedges_total{retrier,backoff}                                                       counter, attempts WithHedge started
-//	go_retry_hedge_wins_total{retrier,backoff}                                                   counter, calls a hedge won
+//	go_retry_calls_total{retrier,backoff,result="success|exhausted|aborted|canceled|budget"} counter
+//	go_retry_attempts_total{retrier,backoff} counter, first attempts included
+//	go_retry_wait_seconds_total{retrier,backoff} counter, time asked to wait
+//	go_retry_hedges_total{retrier,backoff} counter, attempts WithHedge started
+//	go_retry_hedge_wins_total{retrier,backoff} counter, calls a hedge won
 var (
 	_callsCounter = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Subsystem: _subsystem, Name: "calls_total",
