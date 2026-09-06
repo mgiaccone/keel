@@ -120,7 +120,7 @@ treats it as fatal, mirroring `MustRegister`. `key` is a `KeyFunc`:
 |---|---|
 | `KeyByHeader(name)` | a request header, such as `X-API-Key`; requests without it share the key `""` |
 | `KeyByRemoteAddr()` | the client IP without the port; behind a proxy, key on the forwarded header only if the proxy is trusted to set it |
-| `KeyGlobal()` | one key for every request |
+| `KeyGlobal()` | one key for every request; `AdmissionGlobal` is the outbound counterpart |
 | your own `func(*http.Request) string` | for example the authenticated tenant from the request context |
 
 | Option | Effect |
@@ -186,13 +186,18 @@ when it is no longer needed.
 ### With a circuit breaker
 
 `Admission(limiter, key)` returns a `func(context.Context) error` that refuses
-with a `*LimitedError`, which is the shape `breaker.WithAdmission` takes:
+with a `*LimitedError`, which is the shape `breaker.WithAdmission` takes.
+`AdmissionGlobal(limiter)` is that with no per-key distinction, which is what
+one breaker in front of one dependency wants:
 
 ```go
 b, err := breaker.New("db-fallback",
-    breaker.WithAdmission(ratelimit.Admission(limiter, "")),   // "" = one limit for the whole dependency
+    breaker.WithAdmission(ratelimit.AdmissionGlobal(limiter)),
 )
 ```
+
+Reach for the keyed form when several breakers share one limiter and each
+needs its own budget: `ratelimit.Admission(limiter, "db-fallback")`.
 
 The breaker runs the veto after the circuit has admitted the call. An open
 circuit still answers `breaker.ErrOpen`, a call the circuit refuses consumes
@@ -202,11 +207,11 @@ bulkhead. The packages do not import each other.
 
 ### As a retry budget
 
-The same `Admission` value is what `retry.WithBudget` takes:
+The same veto is what `retry.WithBudget` takes:
 
 ```go
 r, err := retry.New("db-fallback", retry.Exponential(50*time.Millisecond, 2*time.Second),
-    retry.WithBudget(ratelimit.Admission(limiter, "")),
+    retry.WithBudget(ratelimit.AdmissionGlobal(limiter)),
 )
 ```
 

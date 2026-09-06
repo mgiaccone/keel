@@ -50,7 +50,7 @@ mux.Handle("/v1/", ratelimit.MustMiddleware(limiter, ratelimit.KeyByHeader("X-AP
 ```go
 r, err := retry.New("db-fallback", retry.Exponential(50*time.Millisecond, 2*time.Second),
     retry.WithMaxAttempts(4),
-    retry.WithBudget(ratelimit.Admission(limiter, "")),      // at most so many retries per second, fleet-wide with Redis
+    retry.WithBudget(ratelimit.AdmissionGlobal(limiter)),    // at most so many retries per second, fleet-wide with Redis
 )
 
 row, err := r.Do(ctx, func(ctx context.Context) (Row, error) {

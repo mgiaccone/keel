@@ -73,7 +73,7 @@ func Example_breaker() {
 	// costs no quota if the circuit is open, and shows up in the breaker's
 	// Stats as denied.
 	b, err := breaker.New("db-fallback",
-		breaker.WithAdmission(ratelimit.Admission(limiter, "")),
+		breaker.WithAdmission(ratelimit.AdmissionGlobal(limiter)),
 		breaker.WithTimeout(2*time.Second),
 	)
 	if err != nil {

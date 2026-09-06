@@ -55,7 +55,7 @@ func Example() {
 	r, err := retry.New("catalogue",
 		retry.Exponential(50*time.Millisecond, 2*time.Second),
 		retry.WithMaxAttempts(4),
-		retry.WithBudget(ratelimit.Admission(budget, "")),
+		retry.WithBudget(ratelimit.AdmissionGlobal(budget)),
 		retry.WithOnRetry(func(attempt int, err error, delay time.Duration) {
 			fmt.Printf("attempt %d failed: %v; retrying in %s\n", attempt, err, delay)
 		}),

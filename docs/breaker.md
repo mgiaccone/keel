@@ -414,11 +414,11 @@ under `WithErrorRate`, and `next_probe_in` appears only while open.
 ### With a rate limiter
 
 `WithAdmission` takes a `func(context.Context) error`. `ratelimit.Admission`
-returns one, so a limiter is attached with:
+and `ratelimit.AdmissionGlobal` return one, so a limiter is attached with:
 
 ```go
 b, err := breaker.New("db-fallback",
-    breaker.WithAdmission(ratelimit.Admission(limiter, "")),
+    breaker.WithAdmission(ratelimit.AdmissionGlobal(limiter)),
 )
 ```
 

@@ -11,8 +11,8 @@ replay.
 r, err := retry.New("catalogue",
     retry.Exponential(50*time.Millisecond, 2*time.Second),
     retry.WithMaxAttempts(4),
-    retry.WithBudget(ratelimit.Admission(budget, "")),   // at most so many retries per second, fleet-wide with Redis
-    retry.WithRetryIf(func(err error) bool {             // a not-found is an answer, not a failure
+    retry.WithBudget(ratelimit.AdmissionGlobal(budget)),  // at most so many retries per second, fleet-wide with Redis
+    retry.WithRetryIf(func(err error) bool {              // a not-found is an answer, not a failure
         return !errors.Is(err, ErrNotFound)
     }),
 )
@@ -385,7 +385,7 @@ itself.
 ```go
 budget, err := ratelimit.New("catalogue-retries", ratelimit.GCRA(10, 20), store)
 r, err := retry.New("catalogue", retry.Exponential(50*time.Millisecond, 2*time.Second),
-    retry.WithBudget(ratelimit.Admission(budget, "")),
+    retry.WithBudget(ratelimit.AdmissionGlobal(budget)),
 )
 ```
 

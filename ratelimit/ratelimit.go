@@ -21,7 +21,8 @@
 //
 // Limits are keyed. The key names what is being limited: an API key or tenant
 // ID for per-client quotas, a route for per-endpoint limits, a client IP for
-// abuse control, or "" for one limit on the whole thing.
+// abuse control. For one limit on the whole thing the key is "": [KeyGlobal]
+// inbound, [AdmissionGlobal] outbound.
 //
 // # Choosing an algorithm
 //
@@ -111,14 +112,16 @@ func (e *LimitedError) RetryDelay() time.Duration { return e.RetryAfter }
 // Admission adapts a limiter to a veto function: nil when the call may
 // proceed, a [*LimitedError] when it is refused, and the limiter's own error
 // when it could not decide, which is fail closed; wrap with [FailOpen] to
-// invert that. It is shaped for breaker.WithAdmission:
+// invert that. It is shaped for breaker.WithAdmission, with a key per breaker
+// when several share one limiter:
 //
-//	b, err := breaker.New("db-fallback", breaker.WithAdmission(ratelimit.Admission(limiter, "")))
+//	b, err := breaker.New("db-fallback", breaker.WithAdmission(ratelimit.Admission(limiter, "db-fallback")))
 //
 // There, the veto runs after the circuit has admitted the call, so an open
 // circuit still answers breaker.ErrOpen, a call the circuit refuses never
 // consumes quota, and a refused call is recorded by the breaker as denied.
-// This package does not depend on the breaker.
+// This package does not depend on the breaker. For one limit on the whole
+// thing, with no per-key distinction, use [AdmissionGlobal].
 func Admission(l Allower, key string) func(context.Context) error {
 	return func(ctx context.Context) error {
 		d, err := l.Allow(ctx, key)
@@ -130,6 +133,13 @@ func Admission(l Allower, key string) func(context.Context) error {
 		}
 		return nil
 	}
+}
+
+// AdmissionGlobal is [Admission] with the key "": one limit on the whole
+// thing, with no per-key distinction. It is the [KeyGlobal] of the Admission
+// family. Use [Admission] with a key when several budgets share one limiter.
+func AdmissionGlobal(l Allower) func(context.Context) error {
+	return Admission(l, "")
 }
 
 // FailOpen wraps an Allower so that an error from it, such as the store being

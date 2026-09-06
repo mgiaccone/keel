@@ -478,7 +478,7 @@ func TestLimitedErrorIs(t *testing.T) {
 
 func TestAdmissionDeniesThroughBreaker(t *testing.T) {
 	h := newHarness(t, GCRA(1, 2))
-	b, err := breaker.New("db", breaker.WithAdmission(Admission(h.Limiter, "")))
+	b, err := breaker.New("db", breaker.WithAdmission(AdmissionGlobal(h.Limiter)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestAdmissionDeniesThroughBreaker(t *testing.T) {
 
 func TestAdmissionOpenCircuitDoesNotConsumeQuota(t *testing.T) {
 	h := newHarness(t, GCRA(1, 1))
-	b, err := breaker.New("db", breaker.WithFailureThreshold(1), breaker.WithAdmission(Admission(h.Limiter, "")))
+	b, err := breaker.New("db", breaker.WithFailureThreshold(1), breaker.WithAdmission(AdmissionGlobal(h.Limiter)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,17 +523,53 @@ func TestAdmissionOpenCircuitDoesNotConsumeQuota(t *testing.T) {
 func TestAdmissionFailsClosedAndFailOpenInverts(t *testing.T) {
 	boom := errors.New("store down")
 	l, _ := New("adm", GCRA(1, 1), failingStore{boom})
-	closed, _ := breaker.New("closed", breaker.WithAdmission(Admission(l, "")))
+	closed, _ := breaker.New("closed", breaker.WithAdmission(AdmissionGlobal(l)))
 	if _, err := closed.Do(context.Background(), func(context.Context) (int, error) { return 1, nil }); !errors.Is(err, boom) {
 		t.Fatalf("fail closed: err = %v", err)
 	}
 	var seen error
-	open, _ := breaker.New("open", breaker.WithAdmission(Admission(FailOpen(l, func(err error) { seen = err }), "")))
+	open, _ := breaker.New("open", breaker.WithAdmission(AdmissionGlobal(FailOpen(l, func(err error) { seen = err }))))
 	if _, err := open.Do(context.Background(), func(context.Context) (int, error) { return 1, nil }); err != nil {
 		t.Fatalf("fail open: err = %v", err)
 	}
 	if !errors.Is(seen, boom) {
 		t.Fatalf("onError saw %v", seen)
+	}
+}
+
+func TestAdmissionGlobalIsAdmissionWithTheEmptyKey(t *testing.T) {
+	h := newHarness(t, GCRA(1, 1))
+	global, keyed := AdmissionGlobal(h.Limiter), Admission(h.Limiter, "")
+	ctx := context.Background()
+	if err := global(ctx); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	// They share one record: the token global spent is the one keyed wanted.
+	var lim *LimitedError
+	if err := keyed(ctx); !errors.Is(err, ErrLimited) || !errors.As(err, &lim) || lim.Key != "" || lim.RetryAfter != time.Second {
+		t.Fatalf("err = %v, lim = %+v", err, lim)
+	}
+}
+
+func TestAdmissionKeepsKeysApart(t *testing.T) {
+	h := newHarness(t, GCRA(1, 1))
+	ctx := context.Background()
+	a, b := Admission(h.Limiter, "tenant-a"), Admission(h.Limiter, "tenant-b")
+	if err := a(ctx); err != nil {
+		t.Fatalf("tenant-a: %v", err)
+	}
+	if err := b(ctx); err != nil {
+		t.Fatalf("tenant-b has its own budget: %v", err)
+	}
+	var lim *LimitedError
+	if err := a(ctx); !errors.As(err, &lim) || lim.Key != "tenant-a" || !strings.Contains(err.Error(), `"tenant-a"`) {
+		t.Fatalf("err = %v, lim = %+v", err, lim)
+	}
+	if err := AdmissionGlobal(h.Limiter)(ctx); err != nil { // a third budget, not a wildcard
+		t.Fatalf("global: %v", err)
+	}
+	if s := h.Stats(); s.Keys != 3 {
+		t.Fatalf("stats = %+v, want three records", s)
 	}
 }
 

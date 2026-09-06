@@ -546,7 +546,7 @@ func TestLimiterRefusalIsWaitedFor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	admit := ratelimit.Admission(limiter, "")
+	admit := ratelimit.AdmissionGlobal(limiter)
 	h := newHarness(t, Constant(10*time.Millisecond), WithMaxAttempts(2))
 	fn := func(ctx context.Context) (int, error) {
 		if err := admit(ctx); err != nil {
@@ -575,7 +575,7 @@ func TestLimiterAsBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := newHarness(t, Constant(time.Millisecond), WithMaxAttempts(10), WithBudget(ratelimit.Admission(limiter, "")))
+	h := newHarness(t, Constant(time.Millisecond), WithMaxAttempts(10), WithBudget(ratelimit.AdmissionGlobal(limiter)))
 	_, err = h.Do(t.Context(), failing(10, errBoom, 1))
 	if err != errBoom {
 		t.Fatalf("err = %v", err)

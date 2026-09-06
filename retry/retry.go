@@ -254,7 +254,7 @@ func WithHedge(after time.Duration) Option {
 // returning the last error from fn; the veto's own error goes to the hook and
 // the observers. It takes the shape ratelimit.Admission returns, so
 //
-//	retry.WithBudget(ratelimit.Admission(limiter, ""))
+//	retry.WithBudget(ratelimit.AdmissionGlobal(limiter))
 //
 // caps retries at the limiter's rate, per process with a memory store or
 // fleet-wide with Redis. This is the bound that matters during an outage:
