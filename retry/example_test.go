@@ -166,3 +166,74 @@ func ExampleWithHedge() {
 	// results <nil>
 	// attempts=2 hedged=1 hedge_won=1
 }
+
+// Example_composition is the full stack from docs/composing.md: an inbound
+// rate limiter admits the request before any dependency is chosen, retry
+// retries the operation, and each attempt is a breaker call bounded by
+// WithTimeout and WithMaxInFlight. Nesting them any other way loses one of
+// these guarantees; see the doc for what and why.
+func Example_composition() {
+	cat := &catalogue{}
+	cat.resets.Store(1) // the first attempt anywhere in this example fails once
+
+	b, err := breaker.New("catalogue-composed",
+		breaker.WithTimeout(2*time.Second), // bounds one attempt, not the whole retry loop
+		breaker.WithMaxInFlight(2),         // bounds concurrent attempts, not concurrent requests
+	)
+	if err != nil {
+		panic(err) // example only
+	}
+	r, err := retry.New("catalogue-composed",
+		retry.Exponential(50*time.Millisecond, 2*time.Second),
+		retry.WithMaxAttempts(4),
+		retry.WithSeed(7, 11), // fixed only so this example's output is stable; omit in production
+		retry.WithSleep(func(context.Context, time.Duration) error { return nil }), // example only: do not really wait
+	)
+	if err != nil {
+		panic(err) // example only
+	}
+
+	// The handler is retry → breaker → the call, wrapped by the inbound
+	// limiter below it. A breaker refusal here would never be retried; none
+	// occurs in this example, only an ordinary transient failure.
+	api := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		v, err := r.Do(req.Context(), func(ctx context.Context) (string, error) {
+			return b.Do(ctx, func(ctx context.Context) (string, error) { return cat.Get(ctx, "sku-1") })
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		fmt.Fprintln(w, v)
+	})
+
+	inboundStore, err := ratelimit.NewMemoryStore()
+	if err != nil {
+		panic(err) // example only
+	}
+	inbound, err := ratelimit.New("api-composed", ratelimit.GCRA(1, 3), inboundStore) // bursts of 3, small so the example is short
+	if err != nil {
+		panic(err) // example only
+	}
+	srv := httptest.NewServer(ratelimit.MustMiddleware(inbound, ratelimit.KeyGlobal())(api))
+	defer srv.Close()
+
+	for i := range 4 {
+		resp, err := http.Get(srv.URL)
+		if err != nil {
+			panic(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		fmt.Printf("request %d: %d %s", i+1, resp.StatusCode, body)
+	}
+	fmt.Println(r.Stats())
+	fmt.Println(b.Stats())
+	// Output:
+	// request 1: 200 widget
+	// request 2: 200 widget
+	// request 3: 200 widget
+	// request 4: 429 rate limit exceeded
+	// retry: name=catalogue-composed backoff=exponential calls=3 attempts=4 ok=3 exhausted=0 aborted=0 canceled=0 budget=0 waited=17.329928ms
+	// breaker: name=catalogue-composed state=closed trips=0(consecutive=0) calls=4 rejected=0 shed=0 denied=0 ok=3 fail=1 canceled=0 in_flight=0/2
+}

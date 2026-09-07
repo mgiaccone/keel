@@ -26,8 +26,11 @@ type Observer interface {
 	// (Acquire returning ok=false) is not a failure and is not delivered
 	// here; only Acquire/Release themselves erroring is.
 	LeaseFailed(err error)
-	// LoadFailed is delivered whenever a load — blocking or a background
-	// refresh — completes with an error.
+	// LoadFailed is delivered whenever a background refresh started by
+	// [ServeAndRefresh] completes with an error. A blocking load's own
+	// failure is never delivered here: it always resolves some caller's
+	// Get as Degraded or Failed instead (see the decision table in
+	// docs/fallback.md), so the caller already has it.
 	LoadFailed(err error)
 	// Refreshed is delivered whenever a background refresh started by
 	// [ServeAndRefresh] completes successfully.
@@ -83,3 +86,10 @@ type PanicError struct {
 
 // Error implements error.
 func (e *PanicError) Error() string { return fmt.Sprintf("fallback: loader panicked: %v", e.Value) }
+
+// Retryable reports false: a panic is a bug in the loader, not a transient
+// condition, and running it again will not fix it. This is the
+// Retryable() bool contract package retry looks for, so a retrier composed
+// around a guarded origin stops on it instead of retrying a panic up to its
+// attempt cap.
+func (e *PanicError) Retryable() bool { return false }

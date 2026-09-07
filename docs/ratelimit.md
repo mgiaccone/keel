@@ -156,6 +156,9 @@ middleware fails open by default, and `FailOpen(limiter, onError)` wraps any
 
 Through `Admission`, a refusal is a `*LimitedError` carrying the key and
 `RetryAfter`; `errors.Is(err, ratelimit.ErrLimited)` matches it.
+[Composing](composing.md)'s "What each layer refuses" has the full
+cross-package error reference, including why the "could not decide" bucket
+above is deliberately left without a `Retryable` answer.
 
 ### What a refusal means to a caller
 
@@ -182,6 +185,10 @@ for the life of the process, as any package-level metric does. Drop a limiter
 when it is no longer needed.
 
 ## Composing
+
+See [Composing](composing.md) for where this package sits in the full stack —
+rate limit, retry, breaker, the call — and why one limiter should not serve
+more than one of its three roles there.
 
 ### With a circuit breaker
 

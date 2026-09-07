@@ -78,12 +78,31 @@ read, err := fallback.New("catalog", cache, fallback.SourceFunc[string, Product]
 product, found, err := read.Get(ctx, id)
 ```
 
+## Composing
+
+The packages nest outward-in, and the order is not interchangeable:
+
+```
+rate limit (inbound)  →  retry  →  breaker (timeout + bulkhead)  →  the call
+```
+
+```go
+mux.Handle("/v1/", ratelimit.MustMiddleware(inbound, ratelimit.KeyByHeader("X-API-Key"))(api))
+
+row, err := r.Do(ctx, func(ctx context.Context) (Row, error) {
+    return b.Do(ctx, func(ctx context.Context) (Row, error) { return db.Get(ctx, key) }) // a breaker refusal is never retried
+})
+```
+
+Retry outside breaker so a refusal is never retried; the breaker's `WithTimeout` bounds one attempt, a `context.WithTimeout` around `r.Do` bounds the whole operation; a retry waits outside the bulkhead permit, never holding it. See [Composing](docs/composing.md) for the full rationale, what breaks under the wrong nesting, and where a fallback reader fits.
+
 ## Documentation
 
 - [Circuit breaker](docs/breaker.md): when a breaker is the right tool, every knob and why, guarantees, metrics, alerts, dashboard, benchmarks.
 - [Rate limiter](docs/ratelimit.md): the algorithm-over-store design, algorithms, stores, Redis, the middleware, metrics, alerts, dashboard.
 - [Retrier](docs/retry.md): the bounds that keep retries safe, schedules, the budget, `Retry-After`, the HTTP replay rule, metrics, alerts, dashboard.
 - [Fallback reader](docs/fallback.md): the fast/authoritative two-source read, the policy model, single-flight and degraded serving, metrics, alerts, dashboard.
+- [Composing](docs/composing.md): the correct nesting order, why each layer sits where it does, and what breaks when you invert it.
 
 Runnable examples with verified output live in each package's `example_test.go`;
 `CONTRIBUTING.md` has how to get set up, what help is wanted and the

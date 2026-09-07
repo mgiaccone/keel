@@ -211,26 +211,43 @@ func WithMaxRetryAfter(d time.Duration) Option {
 }
 
 // WithHedge starts another attempt when the ones in flight have not answered
-// after d, up to [WithMaxAttempts]. The first success wins; the rest are
-// cancelled through their contexts and their results discarded. Off by
+// after the given delay, up to [WithMaxAttempts]. The first success wins; the
+// rest have their contexts cancelled and their results discarded. Off by
 // default.
+//
+// fn must be safe to run more than once concurrently with itself: a hedge can
+// have two attempts in flight at the same time, so a non-idempotent handler
+// can double-apply without either attempt having failed — a call a sequential
+// retry would never make, since there a second attempt only ever follows a
+// first that has already ended. Mark the operation safe with an idempotency
+// key the caller generates once per operation and sends on every attempt; the
+// HTTP transport already treats Idempotency-Key and X-Idempotency-Key as a
+// replay signal. This package neither generates nor stores such a key — that
+// is the caller's and the server's contract, not this package's.
+//
+// Cancelling a loser's context is best effort, not a guarantee: it can stop
+// fn from starting more work, but it cannot unsend a request already on the
+// wire, so a losing attempt's write may still reach and be applied by the
+// dependency after Do has returned with a different attempt's answer. A loser
+// that itself succeeds is not distinguished from one that failed or was
+// cancelled — its result is discarded and, on the HTTP transport, its
+// response body is drained and closed — so the caller has no way to learn
+// that a losing write landed.
 //
 // A retry helps when an attempt fails; a hedge helps when an attempt is slow.
 // It cuts the latency tail that a few slow replicas cause, at the cost of
 // extra load, and against a dependency that is uniformly slow it only doubles
-// that load. Hedges need idempotency even more than retries, since two
-// attempts may both run to completion, and fn is called concurrently with
-// itself. Hedge only with a budget.
+// that load. Hedge only with a budget.
 //
 // A hedge asks the budget like a retry, and a refusal ends every further
 // attempt of the call: the attempts in flight finish and decide it. Hedges
 // count against the attempt cap together with retries. A failure while other
 // attempts are running starts nothing; once every attempt in flight has
-// failed, the ordinary retry path applies with the schedule's wait, which d
-// does not floor, and the schedule is asked for the wait after that many
-// failed attempts, hedges included. A failure that must not be retried, or
-// the caller's context ending, cancels the other attempts and ends the call
-// at once.
+// failed, the ordinary retry path applies with the schedule's wait, which the
+// hedge delay does not floor, and the schedule is asked for the wait after
+// that many failed attempts, hedges included. A failure that must not be
+// retried, or the caller's context ending, cancels the other attempts and
+// ends the call at once.
 //
 // Each attempt runs on a context derived from the caller's. The context of
 // the attempt whose result Do returns, the winner or the last failure, is

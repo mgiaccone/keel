@@ -352,7 +352,9 @@ clients as `503 Service Unavailable` with a `Retry-After` (for `ErrOpen`,
 `Stats.NextProbeIn`), and not retry: a retry is refused again or takes the
 probe slot recovery depends on. The refusals answer false to the `Retryable`
 contract, so a [`retry`](retry.md) retrier stops on them without either
-package importing the other.
+package importing the other. [Composing](composing.md)'s "What each layer
+refuses" has the full cross-package error reference, including `retry`'s
+and `ratelimit`'s own errors.
 
 ### Results
 
@@ -410,6 +412,9 @@ under `WithErrorRate`, and `next_probe_in` appears only while open.
   propagates.
 
 ## Composing
+
+See [Composing](composing.md) for where this package sits in the full stack —
+rate limit, retry, breaker, the call — and why.
 
 ### With a rate limiter
 

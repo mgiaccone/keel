@@ -153,6 +153,26 @@ A background refresh that completes successfully counts `Refreshes`, disjoint fr
 never resolves a `Get` by itself, so it is not a term in the identity below. One that fails counts
 `LoadFailures`; a blocking load's failure is always some caller's `Degraded` or `Failed` instead.
 
+### Errors from `Get`
+
+| Error | When | Origin consulted |
+|---|---|---|
+| `ctx.Err()` | `ctx` was already done, or ended while `Get` was joining a load already in flight | no, or partially |
+| the origin's error, unchanged | a blocking `Load` failed, or a `LoadOrServe` failed with nothing stale to fall back to | yes |
+| `*PanicError` | the origin's `Get` recovered from a panic | yes |
+| `nil` | `LoadOrServe` degraded: the load failed but a stale value was served instead — check `Stats.Degraded` or the `Observer`'s `Get(Degraded)`, not the error, to notice this happened | yes |
+
+`Reader` wraps nothing, ever, on this path — no `fmt.Errorf`, no new error type but
+`*PanicError` for the one case that is its own event. The origin's error passes through
+`GuardedSource`, `callOrigin` and single-flight completely unchanged, so `errors.Is`,
+`errors.As`, and any `Retryable()`/`RetryDelay()` it implements — a breaker's refusal among
+them — survive intact to the caller of `Get`. The fast source's own error, by contrast, never
+reaches the caller at all: it is swallowed at the point `Get` decides to fall through to the
+origin, counted only as `FastErrors` and delivered only to `Observer.FastError`. A breaker
+guarding the *fast* source (`GuardedStore`) can therefore never surface `ErrOpen` from `Get` —
+only a guarded *origin*'s refusal can. See [Composing](composing.md) for how this fits with
+the rest of the stack and the full cross-package error reference.
+
 ### `Stats`
 
 `Stats` returns cumulative counters. Identity: `Served + Loaded + Degraded + Failed + Aborted ==
@@ -182,6 +202,10 @@ mid-refresh and lose a write-back. The caller must stop issuing `Get` before cal
 same precondition `sync.WaitGroup.Wait` documents for `Add`.
 
 ## Composing
+
+See [Composing](composing.md) for where a reader sits relative to the rest of
+the stack, and why each source gets its own breaker rather than one shared
+across both.
 
 ### With a circuit breaker
 

@@ -66,7 +66,9 @@ slow replicas cause. Against a dependency that is uniformly slow it doubles
 the load and helps nobody, and during an outage it is amplification on
 purpose, so hedge only with a budget, and only where the tail comes from
 replicas rather than from the request itself. Hedges need idempotency even
-more than retries: two attempts may both run to completion.
+more than retries: two attempts may both run to completion, and cancelling
+the loser is best effort, not a guarantee — see Hedging below for what that
+means for a caller.
 
 ## How it works
 
@@ -100,7 +102,27 @@ not.
 
 `WithHedge(after)` runs attempts concurrently. Each gets its own context
 derived from the caller's, and `fn` is called concurrently with itself,
-which is a requirement of the option. The rules:
+which is a requirement of the option.
+
+**`fn` must be safe to run more than once concurrently with itself.** Hedging
+can have two attempts in flight at the same time, so a non-idempotent handler
+can double-apply *without either attempt having failed* — unlike a sequential
+retry, where a second attempt only ever follows a first that has already
+ended. Mark the operation safe with an idempotency key the caller generates
+once per operation and sends on every attempt; the HTTP transport already
+treats `Idempotency-Key` and `X-Idempotency-Key` as a replay signal. This
+package neither generates nor stores such a key — that is the caller's and
+the server's contract.
+
+Cancelling a loser is **best effort, not a guarantee**: it stops `fn` from
+starting more work on that attempt, but it cannot unsend a request already
+on the wire, so a losing attempt's write may still reach and be applied by
+the dependency after `Do` has returned a different attempt's answer. A loser
+that itself succeeds is not distinguished from one that failed or was
+cancelled — see rule 3 below — so the caller has no way to learn that a
+losing write landed.
+
+The rules:
 
 1. Attempt 1 starts and a timer is armed for `after`.
 2. The timer fires with attempts in flight. If the cap allows and the budget
@@ -110,12 +132,16 @@ which is a requirement of the option. The rules:
    `Attempt` and then `Hedge` reach the observers, and the timer is
    re-armed.
 3. A success ends the call at once: every other attempt is cancelled and
-   `Do` does not wait for them. Their results are discarded. The winner's
-   context is left alive, since the value it produced may keep using it
-   after `Do` returns, an HTTP body for one; it ends with the caller's.
-   The same holds for the attempt whose failure `Do` returns: what it
-   produced, a 503 with a body, is usable, and its context ends with the
-   caller's. Every other attempt's context ends with the call.
+   `Do` does not wait for them. Their results are discarded — including one
+   that itself succeeded but arrived after the winner: its value is dropped
+   and, on the HTTP transport, its response body is drained and closed
+   unread, so the caller cannot tell that this attempt's write reached the
+   server and was applied. The winner's context is left alive, since the
+   value it produced may keep using it after `Do` returns, an HTTP body for
+   one; it ends with the caller's. The same holds for the attempt whose
+   failure `Do` returns: what it produced, a 503 with a body, is usable, and
+   its context ends with the caller's. Every other attempt's context ends
+   with the call.
 4. A failure while other attempts are running is classified. Not retryable,
    or asking for a delay above `WithMaxRetryAfter`: the others are cancelled
    and the call is **aborted** with that error. The caller's context is done:
@@ -206,13 +232,15 @@ The packages do not import each other.
 
 ### Composition order
 
-The stack is retry → breaker → limiter. Each attempt is a breaker call, so it
+Each attempt is a breaker call, so the breaker goes inside the retrier: it
 gets the breaker's per-attempt timeout and bulkhead and is counted by the
 breaker as a call. A breaker refusal, `ErrOpen`, `ErrProbeLimit`,
 `ErrBulkhead` or `ErrStopped`, answers false to `Retryable`, so the retrier
 stops on it: a retry would be refused again or take the probe slot recovery
 depends on. A limiter refusal from `WithAdmission` answers true and carries
-its delay, so the retrier waits for it.
+its delay, so the retrier waits for it. See [Composing](composing.md) for the
+full stack, including where the inbound rate limiter and a fallback reader
+sit and what breaks under the wrong nesting.
 
 ### The HTTP replay rule
 
@@ -301,6 +329,9 @@ does not go away on retry.
 
 The retrier never rewrites `fn`'s error. Which bound ended a call is in
 `Stats`, the observer, the hook and the `result` label, not in the error.
+[Composing](composing.md)'s "What each layer refuses" has the full
+cross-package error reference, including `Permanent`, `StatusError` and
+every other package's own errors.
 
 ### The cross-package contract
 
@@ -365,6 +396,9 @@ retry: name=catalogue backoff=exponential calls=812 attempts=901 ok=800 exhauste
   heap-allocated by the caller, see Benchmarks.
 
 ## Composing
+
+See [Composing](composing.md) for where this package sits in the full stack —
+rate limit, retry, breaker, the call — and why.
 
 ### With a circuit breaker
 
