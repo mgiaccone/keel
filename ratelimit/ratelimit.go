@@ -61,11 +61,20 @@ type Decision struct {
 // Allower is what [Middleware], [Admission] and [FailOpen] accept: anything
 // that can decide whether a call for a key may start. [*Limiter] is the
 // implementation in this package; the interface exists so callers can wrap
-// or fake it. The error return means "could not decide", which is different
-// from "not allowed"; the caller chooses whether to fail open or closed.
+// or fake it — [FailOpen] wraps one, [AllowerFunc] fakes one. The error
+// return means "could not decide", which is different from "not allowed";
+// the caller chooses whether to fail open or closed.
 type Allower interface {
 	Allow(ctx context.Context, key string) (Decision, error)
 }
+
+// AllowerFunc adapts a function to [Allower], for a one-off decision that
+// does not warrant a named type: a fake in a caller's own tests, a kill
+// switch standing in for a real limit, a combinator over other Allowers.
+type AllowerFunc func(ctx context.Context, key string) (Decision, error)
+
+// Allow implements [Allower].
+func (f AllowerFunc) Allow(ctx context.Context, key string) (Decision, error) { return f(ctx, key) }
 
 var (
 	// ErrLimited is matched by every refusal returned through [Admission];

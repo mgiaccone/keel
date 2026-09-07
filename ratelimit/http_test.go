@@ -18,10 +18,6 @@ func serve(h http.Handler, key string) *httptest.ResponseRecorder {
 	return rec
 }
 
-type allowerFunc func(context.Context, string) (Decision, error)
-
-func (f allowerFunc) Allow(ctx context.Context, key string) (Decision, error) { return f(ctx, key) }
-
 var ok = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 
 func TestMiddlewareAllowsThenLimitsWithHeaders(t *testing.T) {
@@ -78,7 +74,7 @@ func TestMiddlewareKeyFuncs(t *testing.T) {
 
 func TestMiddlewareErrorPolicy(t *testing.T) {
 	boom := errors.New("redis down")
-	failing := allowerFunc(func(context.Context, string) (Decision, error) { return Decision{}, boom })
+	failing := AllowerFunc(func(context.Context, string) (Decision, error) { return Decision{}, boom })
 
 	var seen error
 	open := MustMiddleware(failing, KeyGlobal(), OnError(func(_ *http.Request, err error) { seen = err }))(ok)
