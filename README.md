@@ -10,6 +10,7 @@ Resilience primitives for Go. Requires Go 1.27.
 | [`breaker`](docs/breaker.md) | What happens to calls: circuit breaker tripped by consecutive failures or an error rate, bulkhead (static or adaptive), per-call timeout, recovery ramp, admission veto. |
 | [`ratelimit`](docs/ratelimit.md) | How fast calls start: GCRA, fixed window or sliding window over a memory or Redis store, as a `net/http` middleware or composed with the breaker. |
 | [`retry`](docs/retry.md) | How many times a call is attempted: four jittered schedules, hedging against slow attempts, a retry budget, `Retry-After`, an `http.RoundTripper`. |
+| [`fallback`](docs/fallback.md) | Which source answers a read: a fast source judged by a policy you supply, an authoritative one behind per-key single-flight, degraded serving when it fails, memory or Redis store. |
 
 ## Install
 
@@ -61,11 +62,28 @@ transport, err := retry.NewTransport(r, nil)                     // retries 408/
 client := &http.Client{Transport: transport}
 ```
 
+### Fallback reader
+
+```go
+cache, err := fallback.NewMemoryStore[string, Product]()                // per process; fallback/redistore for one copy fleet-wide
+read, err := fallback.New("catalog", cache, fallback.SourceFunc[string, Product](repo.Find),
+    fallback.WithPolicy(func(p Product, now time.Time) fallback.Verdict {
+        if now.Sub(p.FetchedAt) < 30*time.Second {
+            return fallback.Serve
+        }
+        return fallback.LoadOrServe                                     // stale beats an error if repo is down
+    }),
+)
+
+product, found, err := read.Get(ctx, id)
+```
+
 ## Documentation
 
 - [Circuit breaker](docs/breaker.md): when a breaker is the right tool, every knob and why, guarantees, metrics, alerts, dashboard, benchmarks.
 - [Rate limiter](docs/ratelimit.md): the algorithm-over-store design, algorithms, stores, Redis, the middleware, metrics, alerts, dashboard.
 - [Retrier](docs/retry.md): the bounds that keep retries safe, schedules, the budget, `Retry-After`, the HTTP replay rule, metrics, alerts, dashboard.
+- [Fallback reader](docs/fallback.md): the fast/authoritative two-source read, the policy model, single-flight and degraded serving, metrics, alerts, dashboard.
 
 Runnable examples with verified output live in each package's `example_test.go`;
 `CONTRIBUTING.md` has how to get set up, what help is wanted and the

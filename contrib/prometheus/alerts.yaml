@@ -1,5 +1,5 @@
 # Prometheus alert and recording rules for keel. See docs/breaker.md,
-# docs/ratelimit.md and docs/retry.md, "Alerting", for the reasoning behind each threshold. The
+# docs/ratelimit.md, docs/retry.md and docs/fallback.md, "Alerting", for the reasoning behind each threshold. The
 # rules assume the default metric namespace "go"; with WithNamespace, rename
 # the metrics here to match. Validate with:
 #   promtool check rules contrib/prometheus/alerts.yaml
@@ -126,3 +126,34 @@ groups:
         > 0.1
     for: 5m
     labels: { severity: page }
+
+- name: fallback
+  rules:
+  # The origin has been failing for a while and readers are living on stale
+  # answers. Not an outage yet — Get is still succeeding — but the origin
+  # needs attention before the stale window it is riding out runs out too.
+  - alert: FallbackDegradedMajority
+    expr: |
+      sum by (name) (rate(go_fallback_gets_total{outcome="degraded"}[5m]))
+        /
+      sum by (name) (rate(go_fallback_gets_total[5m]))
+        > 0.33
+    for: 10m
+    labels: { severity: ticket }
+    annotations:
+      summary: "{{ $labels.name }} serving stale answers for {{ $value | humanizePercentage }} of gets"
+
+  # Reads are failing outright: either both sources are down, or a
+  # Load-verdict policy is refusing to degrade when LoadOrServe could.
+  - alert: FallbackFailing
+    expr: sum by (name) (rate(go_fallback_gets_total{outcome="failed"}[5m])) > 0
+    for: 2m
+    labels: { severity: page }
+
+  # The fast source itself is unwell. Get still succeeds through the origin,
+  # so this is a ticket, not a page — but every read is paying the origin's
+  # full latency until it is fixed.
+  - alert: FallbackFastSourceErrors
+    expr: sum by (name) (rate(go_fallback_fast_errors_total[5m])) > 0
+    for: 5m
+    labels: { severity: ticket }
