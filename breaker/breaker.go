@@ -23,6 +23,8 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"time"
+
+	"github.com/mgiaccone/keel/internal/ring"
 )
 
 // State is the position of the circuit.
@@ -1038,66 +1040,36 @@ type machine struct {
 	calls, rejected, shed, denied, admitted, successes, failures, canceled, trips uint64
 }
 
-// window is the error-rate ring: buckets of equal width aligned to multiples
-// of that width since the Unix epoch, the newest at head. ok and fail are the
-// sums over the ring, so the rate costs nothing to read.
+// window is the error-rate ring over a shared [ring.Ring]. ok and fail are the
+// sums over it, kept here rather than recomputed, so the rate costs nothing to
+// read; rotate is what keeps them honest as buckets age out.
 type window struct {
-	width    time.Duration
-	buckets  []bucket
-	head     int   // index of the newest bucket
-	slot     int64 // the newest bucket's slot: its start divided by width
-	anchored bool  // slot is meaningful; false for a fresh or cleared ring
-	ok       int
-	fail     int
+	ring     *ring.Ring[bucket]
+	ok, fail int
 }
 
 type bucket struct{ ok, fail int }
 
 func newWindow(r *errorRate) *window {
-	return &window{width: r.window / time.Duration(r.buckets), buckets: make([]bucket, r.buckets)}
+	return &window{ring: ring.New[bucket](r.window, r.buckets)}
 }
 
 // rotate advances the ring to now, dropping buckets that have left the
-// window, and reports whether any outcome was dropped. A gap of a whole
-// window clears the ring. The first rotation of a fresh or cleared ring
-// anchors it at now, whatever now is: no slot value is a sentinel, so a
-// clock before the epoch works like any other.
+// window, and reports whether any outcome was dropped.
 func (w *window) rotate(now time.Time) bool {
-	slot := now.UnixNano() / int64(w.width)
-	if !w.anchored {
-		w.slot, w.anchored = slot, true
-		return false
-	}
-
-	k := slot - w.slot
-	if k <= 0 {
-		return false
-	}
-
 	dropped := false
-	if k >= int64(len(w.buckets)) {
-		dropped = w.ok+w.fail > 0
-		clear(w.buckets)
-		w.head, w.ok, w.fail = 0, 0, 0
-	} else {
-		for range k {
-			w.head = (w.head + 1) % len(w.buckets)
-			b := &w.buckets[w.head]
-			dropped = dropped || b.ok+b.fail > 0
-			w.ok -= b.ok
-			w.fail -= b.fail
-			*b = bucket{}
-		}
-	}
-
-	w.slot = slot
+	w.ring.Rotate(now, func(b *bucket) {
+		dropped = dropped || b.ok+b.fail > 0
+		w.ok -= b.ok
+		w.fail -= b.fail
+	})
 	return dropped
 }
 
 // record enters an outcome in the bucket for now.
 func (w *window) record(now time.Time, failed bool) {
 	w.rotate(now)
-	b := &w.buckets[w.head]
+	b := w.ring.Head()
 	if failed {
 		b.fail++
 		w.fail++
@@ -1108,8 +1080,8 @@ func (w *window) record(now time.Time, failed bool) {
 }
 
 func (w *window) reset() {
-	clear(w.buckets)
-	w.head, w.slot, w.anchored, w.ok, w.fail = 0, 0, false, 0, 0
+	w.ring.Reset()
+	w.ok, w.fail = 0, 0
 }
 
 func (w *window) calls() int { return w.ok + w.fail }
