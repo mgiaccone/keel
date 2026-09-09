@@ -1,5 +1,6 @@
 # Prometheus alert and recording rules for keel. See docs/breaker.md,
-# docs/ratelimit.md, docs/retry.md and docs/fallback.md, "Alerting", for the reasoning behind each threshold. The
+# docs/ratelimit.md, docs/retry.md, docs/fallback.md and docs/overload.md,
+# "Alerting", for the reasoning behind each threshold. The
 # rules assume the default metric namespace "go"; with WithNamespace, rename
 # the metrics here to match. Validate with:
 #   promtool check rules contrib/prometheus/alerts.yaml
@@ -157,3 +158,28 @@ groups:
     expr: sum by (name) (rate(go_fallback_fast_errors_total[5m])) > 0
     for: 5m
     labels: { severity: ticket }
+
+- name: overload
+  rules:
+  # A tenth of traffic refused for five minutes is not a burst any more: either
+  # the capacity estimate has collapsed onto something genuinely slow, or the
+  # traffic is beyond what this fleet can serve and it needs more instances. A
+  # ratio, so low-volume limiters need no per-service threshold, and the same 5m
+  # sustain window every other page-severity rule here uses — shorter would fire
+  # on the bursts the limiter exists to absorb.
+  #
+  # Note what the ratio counts: overload.Admission vetoes land on the same name
+  # and result labels as Middleware, and refuse far more freely, since a veto
+  # holds no slot. A limiter used both ways can cross this threshold on its
+  # outbound vetoes alone. Give the veto its own limiter name if you want this
+  # rule to be about inbound shedding only.
+  - alert: OverloadSheddingSustained
+    expr: |
+      sum by (name) (rate(go_overload_requests_total{result="shed"}[5m]))
+        /
+      sum by (name) (rate(go_overload_requests_total[5m]))
+        > 0.1
+    for: 5m
+    labels: { severity: page }
+    annotations:
+      summary: "{{ $labels.name }} shedding {{ $value | humanizePercentage }} of requests"

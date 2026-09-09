@@ -11,6 +11,7 @@ Resilience primitives for Go. Requires Go 1.27.
 | [`ratelimit`](docs/ratelimit.md) | How fast calls start: GCRA, fixed window or sliding window over a memory or Redis store, as a `net/http` middleware or composed with the breaker. |
 | [`retry`](docs/retry.md) | How many times a call is attempted: four jittered schedules, hedging against slow attempts, a retry budget, `Retry-After`, an `http.RoundTripper`. |
 | [`fallback`](docs/fallback.md) | Which source answers a read: a fast source judged by a policy you supply, an authoritative one behind per-key single-flight, degraded serving when it fails, memory or Redis store. |
+| [`overload`](docs/overload.md) | Whether the process takes one more request at all: inbound admission held to a concurrency limit it measures for itself, priority load shedding, an optional bounded wait, a `net/http` middleware. |
 
 ## Install
 
@@ -78,23 +79,41 @@ read, err := fallback.New("catalog", cache, fallback.SourceFunc[string, Product]
 product, found, err := read.Get(ctx, id)
 ```
 
+### Load shedding
+
+```go
+l, err := overload.New("api", overload.Gradient(4, 200), 0.6, 0.85)   // min/max in flight; sheddable and default shares
+
+mux.Handle("/v1/", overload.MustMiddleware(l,
+    overload.WithPriority(func(r *http.Request) overload.Priority {
+        if strings.HasPrefix(r.URL.Path, "/v1/beacon") {
+            return overload.Sheddable                                  // nobody is waiting on it
+        }
+        return overload.Default
+    }),
+)(api))
+
+mux.HandleFunc("/healthz", health)                                     // outside the middleware: never shed
+```
+
 ## Composing
 
 The packages nest outward-in, and the order is not interchangeable:
 
 ```
-rate limit (inbound)  →  retry  →  breaker (timeout + bulkhead)  →  the call
+load shed  →  rate limit (inbound)  →  retry  →  breaker (timeout + bulkhead)  →  the call
 ```
 
 ```go
-mux.Handle("/v1/", ratelimit.MustMiddleware(inbound, ratelimit.KeyByHeader("X-API-Key"))(api))
+mux.Handle("/v1/", overload.MustMiddleware(shedder)(                                   // your saturation, before their quota
+    ratelimit.MustMiddleware(inbound, ratelimit.KeyByHeader("X-API-Key"))(api)))
 
 row, err := r.Do(ctx, func(ctx context.Context) (Row, error) {
     return b.Do(ctx, func(ctx context.Context) (Row, error) { return db.Get(ctx, key) }) // a breaker refusal is never retried
 })
 ```
 
-Retry outside breaker so a refusal is never retried; the breaker's `WithTimeout` bounds one attempt, a `context.WithTimeout` around `r.Do` bounds the whole operation; a retry waits outside the bulkhead permit, never holding it. See [Composing](docs/composing.md) for the full rationale, what breaks under the wrong nesting, and where a fallback reader fits.
+Load shedding outermost, so a request refused for your own saturation never spends a client's quota; retry outside breaker so a refusal is never retried; the breaker's `WithTimeout` bounds one attempt, a `context.WithTimeout` around `r.Do` bounds the whole operation; a retry waits outside the bulkhead permit, never holding it. See [Composing](docs/composing.md) for the full rationale, what breaks under the wrong nesting, and where a fallback reader fits.
 
 ## Documentation
 
@@ -102,6 +121,7 @@ Retry outside breaker so a refusal is never retried; the breaker's `WithTimeout`
 - [Rate limiter](docs/ratelimit.md): the algorithm-over-store design, algorithms, stores, Redis, the middleware, metrics, alerts, dashboard.
 - [Retrier](docs/retry.md): the bounds that keep retries safe, schedules, the budget, `Retry-After`, the HTTP replay rule, metrics, alerts, dashboard.
 - [Fallback reader](docs/fallback.md): the fast/authoritative two-source read, the policy model, single-flight and degraded serving, metrics, alerts, dashboard.
+- [Load shedding](docs/overload.md): the boundary against `ratelimit` and `breaker`, the two algorithms, the shares, the optional wait queue, metrics, alerts, dashboard.
 - [Composing](docs/composing.md): the correct nesting order, why each layer sits where it does, and what breaks when you invert it.
 
 Runnable examples with verified output live in each package's `example_test.go`;

@@ -2,7 +2,7 @@
 # runs, so a green check here is a green check there.
 
 GO         ?= go
-BENCH_PKGS := ./breaker/ ./ratelimit/ ./retry/ ./fallback/
+BENCH_PKGS := ./breaker/ ./ratelimit/ ./retry/ ./fallback/ ./overload/
 
 .DEFAULT_GOAL := help
 

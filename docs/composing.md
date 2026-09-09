@@ -1,6 +1,6 @@
 # Composing
 
-keel gives you four independent pieces and no import that stacks them for you — they compose
+keel gives you five independent pieces and no import that stacks them for you — they compose
 through the contracts in [`.claude/CLAUDE.md`](../.claude/CLAUDE.md)'s Architecture section
 (a `func(context.Context) error` veto, and errors answering `Retryable() bool` /
 `RetryDelay() time.Duration`), never by one package importing another. That freedom comes with
@@ -10,25 +10,46 @@ review and fails only under load. This page is the rule.
 ## The stack
 
 ```
-rate limit (inbound)  →  retry  →  breaker (timeout + bulkhead)  →  the call
+load shed  →  rate limit (inbound)  →  retry  →  breaker (timeout + bulkhead)  →  the call
 ```
 
 | Layer | Package | Bounds |
 |---|---|---|
+| Saturation | `overload` (`Middleware`) | Whether this process takes one more request at all |
 | Inbound admission | `ratelimit` (`Middleware`) | How fast requests are accepted at all |
 | Attempts | `retry` | How many times one operation is tried |
 | Per-attempt | `breaker` | Whether an attempt runs, and how long it may take |
 | Outbound budget | `ratelimit` (`WithBudget`) | How many retries the fleet may spend |
 
 `ratelimit` appears twice, in two different roles — see point 5 below; they are not the same
-limiter. A future load-shedding package sits above the inbound limiter in this stack, refusing
-work before it spends a client's quota; it does not exist yet (tracked in issue #4, with the
-design still under review in `docs/design/shedding.md`), so treat the top of this diagram as
-provisional until that lands.
+limiter.
 
 ## Why each layer sits where it does
 
-1. **Retry sits outside the breaker.** Every `breaker` refusal — `ErrOpen`, `ErrProbeLimit`,
+1. **Load shedding sits outermost, above the inbound rate limiter.** The two answer different
+   questions and neither substitutes for the other: a rate limit is a promise made *to a caller*
+   about their quota, and exceeding it is the caller's fault, which is why it answers 429; a shed
+   is *your own* saturation, and the caller did nothing wrong, which is why it answers 503. Every
+   client can be comfortably inside its quota while the sum of them is more than the process can
+   serve, so the quota check cannot protect you from saturation; and the shedder has no idea who
+   anyone is, so it cannot enforce a quota. A busy service wants both.
+
+   The order between them follows from that. Put the shedder outside and a request refused for
+   load costs the limiter nothing and, more importantly, costs the client nothing: it never spends
+   quota it did not get served for, so a saturated instance does not silently eat the budget of
+   every caller it turns away. Invert them and a shed request has already been charged — the
+   client is billed for work this process then refused to do, and its quota is exhausted by your
+   outage rather than by its own traffic. The shedder is also the cheaper check of the two (a
+   count under a mutex, no header parse and no store round trip), so putting it first is what you
+   would want on cost grounds even if the accounting did not settle it.
+
+   `overload.Admission` returns the same veto shape as `ratelimit.Admission`, and it is tempting
+   to reach for it instead of the middleware. It is a weaker placement on purpose — see
+   [`docs/overload.md`](overload.md), "Composing": a veto has no release, so it holds no slot and
+   feeds the capacity estimate nothing, and composed into a breaker it runs after the call has
+   already been accepted onto the request path.
+
+2. **Retry sits outside the breaker.** Every `breaker` refusal — `ErrOpen`, `ErrProbeLimit`,
    `ErrBulkhead`, `ErrStopped` — is the unexported type `refusal`, which answers
    `Retryable() bool { return false }` ([`breaker/breaker.go:56-66`](../breaker/breaker.go)).
    `retry.classify` consults that contract *before* `WithRetryIf`
@@ -40,12 +61,12 @@ provisional until that lands.
    Composing them the other way — a breaker wrapping a retrier — does not merely lose that
    guarantee, it breaks four things at once: the breaker now counts one outcome per whole
    *operation* instead of per call, so its consecutive-failure run and error-rate window trip
-   on a completely different cadence than they were sized for; `WithTimeout` (point 2) now
+   on a completely different cadence than they were sized for; `WithTimeout` (point 3) now
    bounds the entire retry loop instead of one attempt; the bulkhead permit is held across
-   every backoff sleep (point 3); and while half-open, the single probe slot is held for the
+   every backoff sleep (point 4); and while half-open, the single probe slot is held for the
    whole loop instead of one call, so nothing else can probe until every retry has run out.
 
-2. **The breaker owns the per-attempt timeout; the caller's context owns the total.**
+3. **The breaker owns the per-attempt timeout; the caller's context owns the total.**
    `breaker.WithTimeout` derives the context `fn` receives, once per admitted call
    ([`breaker/breaker.go:871-875`](../breaker/breaker.go)), and the clock starts only after any
    `WithAdmission` veto has returned (`:868`). `retry` has no timeout option at all — its only
@@ -70,7 +91,7 @@ provisional until that lands.
    ([`docs/breaker.md`](breaker.md), "The error-rate window"); on a low-volume one, size
    `WithFailureThreshold` with it in mind.
 
-3. **Bulkhead permits and retries: keel releases the permit before it waits.**
+4. **Bulkhead permits and retries: keel releases the permit before it waits.**
    `breaker.Do` frees the in-flight slot in a `defer` that blocks until the state goroutine
    acknowledges it ([`breaker/breaker.go:861`](../breaker/breaker.go)), so the permit is gone
    before `Do` returns to its caller — and therefore before an enclosing retrier computes the
@@ -84,14 +105,14 @@ provisional until that lands.
    the call holds its slot ([`breaker/breaker.go:395-397`](../breaker/breaker.go)), so a slow
    distributed limiter consumes bulkhead capacity like any other part of the call.
 
-4. **Rate limiter placement is three separate jobs behind one type.** `ratelimit.Admission`
+5. **Rate limiter placement is three separate jobs behind one type.** `ratelimit.Admission`
    and `ratelimit.AdmissionGlobal` return the same `func(context.Context) error` shape that
    both `breaker.WithAdmission` and `retry.WithBudget` accept, and it is tempting to reach for
    one limiter and wire it everywhere. Don't — the jobs are different promises, not the same
    check in three places:
 
-   - **`ratelimit.Middleware`, outermost, inbound.** A promise made *to a caller*: their quota.
-     Refuses before any dependency is chosen, at the cost of a header parse.
+   - **`ratelimit.Middleware`, inbound, just inside the shedder.** A promise made *to a caller*:
+     their quota. Refuses before any dependency is chosen, at the cost of a header parse.
    - **`retry.WithBudget`, on the retry loop.** Bounds the fleet's own *retries*, per process
      with a memory store or fleet-wide with `redistore` — the bound that still holds when every
      instance is retrying at once during an outage ([`docs/retry.md`](retry.md), "When to use
@@ -108,8 +129,11 @@ provisional until that lands.
 ## The whole stack
 
 ```go
+shedder, err := overload.New("public-api", overload.Gradient(8, 300), 0.6, 0.85)
 inbound, err := ratelimit.New("public-api", ratelimit.GCRA(200, 50), inboundStore)
-mux.Handle("/v1/", ratelimit.MustMiddleware(inbound, ratelimit.KeyByHeader("X-API-Key"))(api))
+mux.Handle("/v1/", overload.MustMiddleware(shedder, overload.WithPriority(byRoute))( // your saturation
+    ratelimit.MustMiddleware(inbound, ratelimit.KeyByHeader("X-API-Key"))(api)))     // their quota
+mux.HandleFunc("/healthz", health)                                                   // wrapped by neither
 
 budget, err := ratelimit.New("catalogue-retries", ratelimit.GCRA(10, 20), budgetStore)
 b, err := breaker.New("catalogue",
@@ -128,8 +152,10 @@ row, err := r.Do(ctx, func(ctx context.Context) (Row, error) {
 })
 ```
 
-`retry/example_test.go`'s `Example_composition` is the compiled, verified version of this
-stack, with `Stats` printed from both the breaker and the retrier.
+`retry/example_test.go`'s `Example_composition` is the compiled, verified version of the
+outbound half of this stack, with `Stats` printed from both the breaker and the retrier;
+`overload/example_test.go`'s `ExampleMiddleware` is the inbound half, including the health
+check deliberately left outside.
 
 ## Where a fallback reader sits
 
@@ -139,7 +165,7 @@ site with `fallback.GuardedStore`/`fallback.GuardedSource`
 ([`docs/fallback.md`](fallback.md), "With a circuit breaker"). Never one breaker shared across
 both sources — a failing fast source would then trip the circuit in front of the origin too,
 which is the one case a fallback reader exists to survive. A retrier, if the origin needs one,
-wraps its guard's breaker from the outside, exactly as point 1 says a retrier wraps any other
+wraps its guard's breaker from the outside, exactly as point 2 says a retrier wraps any other
 breaker — never the other way around: the reader itself has no opinion about retries or rate
 limits, only about which of its two sources answers.
 
@@ -159,12 +185,17 @@ general whether *that* failure is transient — see the last two rows.
 | Error | From | `Retryable()` | What a caller does |
 |---|---|---|---|
 | `ErrOpen`, `ErrProbeLimit`, `ErrBulkhead`, `ErrStopped` | `breaker` | false | Fail fast. An enclosing `retry.Do` stops on it by contract; don't loop around it by hand. |
+| `*overload.ShedError` | `overload.Acquire`, `Middleware`, `Admission` | false | Fail fast, and do not retry inside this process — the retry is more of exactly the load that caused it. Inbound, `Middleware` answers 503 with a jittered `Retry-After`; a client across the boundary sees that 503 and is told `true` by `*retry.StatusError`, which is correct. |
 | `*ratelimit.LimitedError` | `ratelimit.Admission`/`AdmissionGlobal` | true, with `RetryDelay()` | An enclosing `retry.Do` waits at least `RetryAfter`. Inbound, `Middleware` sets `Retry-After` on the response instead. |
 | A budget veto's error | `retry.WithBudget` | n/a — ends the call as **budget** | `Do` returns the dependency's *last* error, not the veto's; the veto's own error goes only to the hook and the observers. |
 | `retry.Permanent(err)` | a caller, wrapping its own `fn`'s error | false | `Do` stops immediately and returns `err` itself unwrapped when `Permanent` is the outermost wrapper — mark a non-idempotent write or a definitive "no" this way, don't rely on `WithRetryIf`. |
 | `*retry.StatusError` | `retry.NewTransport`, for a retried HTTP response | true, with `RetryDelay()` from `Retry-After` | Never seen by a caller — the transport returns the final `*http.Response` once retries end, not this error. Exported only so `WithOnRetry`/`WithRetryIf` can recognise it. |
 | `ratelimit.ErrContention`, or a `Store`'s own error | `ratelimit.Allow`, wrapped | neither method — falls to `retry`'s default (retries everything) | Deliberately one undifferentiated "could not decide" bucket, distinct from a refusal ([`docs/ratelimit.md`](ratelimit.md), "Errors") — `ratelimit` cannot know in general whether a given `Store`'s failure is transient. Supply your own `WithRetryIf` if the default is wrong for your `Store`. |
 | `*fallback.PanicError` | `fallback.Reader.Get`, a recovered loader panic | false | A bug in the loader, not a transient condition. An enclosing `retry.Do` stops on it by contract, same as a breaker refusal. |
+
+One more error `overload.Acquire` can return is not in the table because it is not the package's
+own verdict: a request queued under `WithMaxWait` whose context ends gets `ctx.Err()` back
+unchanged, and is counted as shed because it was not served either way.
 
 Two rows are deliberately absent because there is nothing package-specific to say: `fn`'s own
 error from `breaker.Do` and the origin's own error from `fallback.Reader.Get` are both
