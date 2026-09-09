@@ -394,7 +394,10 @@ func (r *Reader[K, V]) joinOrStartLoad(key K) *call[V] {
 	r.mu.Unlock()
 
 	r.wg.Add(1)
-	go r.runLoad(key, c, false)
+	go func() {
+		defer r.wg.Done()
+		r.runLoad(key, c, false)
+	}()
 	return c
 }
 
@@ -412,7 +415,10 @@ func (r *Reader[K, V]) startRefresh(key K) {
 	r.mu.Unlock()
 
 	r.wg.Add(1)
-	go r.runRefresh(key, c)
+	go func() {
+		defer r.wg.Done()
+		r.runRefresh(key, c)
+	}()
 }
 
 // runRefresh applies jitter and an optional lease before handing off to
@@ -475,14 +481,17 @@ func (r *Reader[K, V]) abandonRefresh(key K, c *call[V]) {
 	delete(r.inflight, key)
 	r.mu.Unlock()
 	close(c.done)
-	r.wg.Done()
 }
 
 // runLoad calls the origin, writes back on success (unless c has been
-// poisoned by a concurrent Invalidate), and always clears r.inflight,
-// closes c.done and calls r.wg.Done — exactly once, regardless of outcome.
+// poisoned by a concurrent Invalidate), and always clears r.inflight and
+// closes c.done, exactly once, regardless of outcome. The caller's own
+// goroutine wrapper owns r.wg.Done — not this function — so that a
+// runRefresh caller's deferred lease Release still counts as part of the
+// in-flight work Close waits on: Done firing from inside runLoad, before
+// control returns to runRefresh, would let Close return while the lease is
+// still held.
 func (r *Reader[K, V]) runLoad(key K, c *call[V], background bool) {
-	defer r.wg.Done()
 	defer func() {
 		r.mu.Lock()
 		delete(r.inflight, key)
